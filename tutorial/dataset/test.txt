@@ -1,0 +1,5 @@
+a purple circle
+a orange square
+a pink triangle
+a cyan circle
+a magenta square

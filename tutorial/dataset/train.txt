@@ -1,0 +1,20 @@
+a red circle
+a blue square
+a green triangle
+a yellow circle
+a red square
+a blue triangle
+a green circle
+a yellow square
+a red triangle
+a blue circle
+a green square
+a yellow triangle
+a small red circle
+a large blue square
+a small green triangle
+a large yellow circle
+a small red square
+a large blue triangle
+a small green circle
+a large yellow square
