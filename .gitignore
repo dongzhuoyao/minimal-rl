@@ -1,1 +1,4 @@
 .DS_Store
+tutorial/__pycache__/
+__pycache__
+tutorial/outputs/example_signals.png
