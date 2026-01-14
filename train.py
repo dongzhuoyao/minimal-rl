@@ -34,73 +34,76 @@ from model import create_mnist_model
 from rewards.mnist_rewards import CombinedMNISTReward, get_recommended_reward_config
 
 
-class PerPromptStatTracker:
+class PerLabelStatTracker:
     """
-    Tracks statistics per prompt/label for computing advantages in GRPO.
+    Tracks statistics per label for computing advantages in GRPO.
     Based on original_impl/flow_grpo/stat_tracking.py
     """
     def __init__(self, global_std=False):
         self.global_std = global_std
         self.stats = {}
-        self.history_prompts = set()
+        self.history_labels = set()
 
-    def update(self, prompts, rewards, type='grpo'):
+    def update(self, labels, rewards, type='grpo'):
         """
-        Compute advantages from rewards using per-prompt statistics.
+        Compute advantages from rewards using per-label statistics.
         
         Args:
-            prompts: List of prompt strings (or labels) [batch_size]
+            labels: Array of labels [batch_size]
             rewards: Array of rewards [batch_size]
             type: Type of advantage computation ('grpo', 'rwr', 'sft', 'dpo')
         
         Returns:
             advantages: Array of advantages [batch_size]
         """
-        prompts = np.array(prompts)
+        labels = np.array(labels)
         rewards = np.array(rewards, dtype=np.float64)
-        unique = np.unique(prompts)
+        unique = np.unique(labels)
         advantages = np.empty_like(rewards) * 0.0
         
-        for prompt in unique:
-            prompt_rewards = rewards[prompts == prompt]
-            if prompt not in self.stats:
-                self.stats[prompt] = []
-            self.stats[prompt].extend(prompt_rewards)
-            self.history_prompts.add(hash(str(prompt)))
+        for label in unique:
+            label_rewards = rewards[labels == label]
+            if label not in self.stats:
+                self.stats[label] = []
+            # Convert to list if it's a numpy array (from previous update)
+            if isinstance(self.stats[label], np.ndarray):
+                self.stats[label] = self.stats[label].tolist()
+            self.stats[label].extend(label_rewards)
+            self.history_labels.add(int(label))
         
-        for prompt in unique:
-            self.stats[prompt] = np.stack(self.stats[prompt])
-            prompt_rewards = rewards[prompts == prompt]
-            mean = np.mean(self.stats[prompt], axis=0, keepdims=True)
+        for label in unique:
+            self.stats[label] = np.stack(self.stats[label])
+            label_rewards = rewards[labels == label]
+            mean = np.mean(self.stats[label], axis=0, keepdims=True)
             if self.global_std:
                 std = np.std(rewards, axis=0, keepdims=True) + 1e-4
             else:
-                std = np.std(self.stats[prompt], axis=0, keepdims=True) + 1e-4
+                std = np.std(self.stats[label], axis=0, keepdims=True) + 1e-4
             
             if type == 'grpo':
-                advantages[prompts == prompt] = (prompt_rewards - mean) / std
+                advantages[labels == label] = (label_rewards - mean) / std
             elif type == 'rwr':
-                advantages[prompts == prompt] = prompt_rewards
+                advantages[labels == label] = label_rewards
             elif type == 'sft':
-                advantages[prompts == prompt] = (torch.tensor(prompt_rewards) == torch.max(torch.tensor(prompt_rewards))).float().numpy()
+                advantages[labels == label] = (torch.tensor(label_rewards) == torch.max(torch.tensor(label_rewards))).float().numpy()
             elif type == 'dpo':
-                prompt_advantages = torch.tensor(prompt_rewards)
-                max_idx = torch.argmax(prompt_advantages)
-                min_idx = torch.argmin(prompt_advantages)
+                label_advantages = torch.tensor(label_rewards)
+                max_idx = torch.argmax(label_advantages)
+                min_idx = torch.argmin(label_advantages)
                 if max_idx == min_idx:
                     min_idx = 0
                     max_idx = 1
-                result = torch.zeros_like(prompt_advantages).float()
+                result = torch.zeros_like(label_advantages).float()
                 result[max_idx] = 1.0
                 result[min_idx] = -1.0
-                advantages[prompts == prompt] = result.numpy()
+                advantages[labels == label] = result.numpy()
         
         return advantages
 
     def get_stats(self):
         avg_group_size = sum(len(v) for v in self.stats.values()) / len(self.stats) if self.stats else 0
-        history_prompts = len(self.history_prompts)
-        return avg_group_size, history_prompts
+        history_labels = len(self.history_labels)
+        return avg_group_size, history_labels
     
     def clear(self):
         self.stats = {}
@@ -284,7 +287,7 @@ def main(cfg: DictConfig):
     reward_fn = get_recommended_reward_config(reward_config, device=device)
     
     # Initialize stat tracker for advantages
-    stat_tracker = PerPromptStatTracker(global_std=cfg.training.get("global_std", False))
+    stat_tracker = PerLabelStatTracker(global_std=cfg.training.get("global_std", False))
     
     # Create data loader
     train_loader = DataLoader(
@@ -319,11 +322,9 @@ def main(cfg: DictConfig):
             epoch += 1
         
         labels = batch["label"].to(device)  # [batch_size]
-        prompts = batch["prompt"]  # List of strings
         
-        # Expand labels and prompts for multiple samples per prompt
+        # Expand labels for multiple samples per label
         expanded_labels = labels.repeat_interleave(num_samples_per_prompt)  # [batch_size * num_samples_per_prompt]
-        expanded_prompts = [p for p in prompts for _ in range(num_samples_per_prompt)]
         
         # Sample trajectories
         with torch.no_grad():
@@ -346,8 +347,9 @@ def main(cfg: DictConfig):
         rewards = reward_fn(images_for_reward, reward_prompts)  # [batch_size * num_samples_per_prompt]
         rewards = rewards.cpu().numpy()
         
-        # Compute advantages using stat tracker
-        advantages = stat_tracker.update(expanded_prompts, rewards, type='grpo')
+        # Compute advantages using stat tracker (use labels directly)
+        expanded_labels_cpu = expanded_labels.cpu().numpy()
+        advantages = stat_tracker.update(expanded_labels_cpu, rewards, type='grpo')
         advantages = torch.tensor(advantages, device=device, dtype=torch.float32)
         
         # Reshape for training: [batch_size * num_samples_per_prompt, num_steps] -> [batch_size, num_samples_per_prompt, num_steps]
@@ -373,7 +375,6 @@ def main(cfg: DictConfig):
                 sample_idx = i * num_samples_per_prompt + j
                 samples.append({
                     "label": expanded_labels[sample_idx],
-                    "prompt": expanded_prompts[sample_idx],
                     "log_probs_old": log_probs_old_full[sample_idx],  # [num_steps]
                     "trajectory": [traj[sample_idx] for traj in trajectories_full],  # List of [signal_dim]
                     "timesteps": timesteps_full[sample_idx],  # [num_steps]

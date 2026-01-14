@@ -51,6 +51,4 @@ class MNISTDataset(Dataset):
         return {
             "image": image_flat,
             "label": label,
-            "prompt": str(label_value),  # Use digit label as prompt string
-            "prompt_id": idx,
         }
