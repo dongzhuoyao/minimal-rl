@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torchvision.utils import make_grid
 import sys
 from tqdm import tqdm
 import os
@@ -283,7 +284,7 @@ def main(cfg: DictConfig):
     
     # Initialize reward function
     print("Initializing reward function...")
-    reward_config = cfg.get("reward", {}).get("config", "balanced")
+    reward_config = cfg.get("reward", {}).get("config", "digit_zero")
     reward_fn = get_recommended_reward_config(reward_config, device=device)
     
     # Initialize stat tracker for advantages
@@ -524,6 +525,31 @@ def main(cfg: DictConfig):
                     if beta > 0:
                         log_dict["train/kl_loss"] = np.mean(info["kl_loss"])
                     
+                    # Visualize sampled images during training using make_grid
+                    num_images_to_log = min(16, len(batch_samples))
+                    images_to_grid = []
+                    captions = []
+                    for i in range(num_images_to_log):
+                        sample = batch_samples[i]
+                        img = sample["image"].cpu()  # [1, 28, 28]
+                        images_to_grid.append(img)
+                        
+                        label = sample["label"].item()
+                        reward = sample["reward"]
+                        advantage = sample["advantages"].item()
+                        captions.append(f"L:{label} R:{reward:.2f} A:{advantage:.2f}")
+                    
+                    # Stack images and create grid
+                    images_tensor = torch.cat(images_to_grid, dim=0)  # [N, 1, 28, 28]
+                    grid = make_grid(images_tensor, nrow=4, normalize=False, pad_value=1.0)
+                    # Convert to numpy for wandb
+                    grid_np = grid.permute(1, 2, 0).cpu().numpy()  # [H, W, C]
+                    grid_np = np.clip(grid_np, 0.0, 1.0)
+                    grid_np = (grid_np * 255).astype(np.uint8)
+                    grid_pil = Image.fromarray(grid_np, mode='RGB')
+                    
+                    log_dict["train/sampled_images"] = wandb.Image(grid_pil, caption="Training samples (Label, Reward, Advantage)")
+                    
                     wandb.log(log_dict, step=step)
                 
                 # Evaluation and checkpointing
@@ -541,16 +567,17 @@ def main(cfg: DictConfig):
                             )
                             test_images = torch.clamp(test_images, 0.0, 1.0)
                             
-                            # Convert to wandb images
-                            wandb_images = []
-                            for i in range(len(test_images)):
-                                img = test_images[i, 0].cpu().numpy()
-                                img = (img * 255).astype(np.uint8)
-                                pil_img = Image.fromarray(img, mode='L')
-                                wandb_img = wandb.Image(pil_img, caption=f"Label: {test_labels[i].item()}")
-                                wandb_images.append(wandb_img)
+                            # Create grid of evaluation images
+                            eval_grid = make_grid(test_images, nrow=4, normalize=False, pad_value=1.0)
+                            # Convert to numpy for wandb
+                            eval_grid_np = eval_grid.permute(1, 2, 0).cpu().numpy()  # [H, W, C]
+                            eval_grid_np = np.clip(eval_grid_np, 0.0, 1.0)
+                            eval_grid_np = (eval_grid_np * 255).astype(np.uint8)
+                            eval_grid_pil = Image.fromarray(eval_grid_np, mode='RGB')
                             
-                            wandb.log({"eval/sampled_images": wandb_images}, step=step)
+                            # Create caption with labels
+                            label_captions = ", ".join([f"L{i}:{test_labels[i].item()}" for i in range(len(test_labels))])
+                            wandb.log({"eval/sampled_images": wandb.Image(eval_grid_pil, caption=f"Evaluation samples - {label_captions}")}, step=step)
                         model.train()
                     
                     # Save checkpoint

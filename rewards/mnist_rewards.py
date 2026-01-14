@@ -1423,19 +1423,123 @@ class MNISTYellowDigitReward:
         return combined_rewards
 
 
+class MNISTDigitZeroReward:
+    """
+    Reward function that encourages generating only digit 0.
+    
+    This reward gives high scores when the generated image is classified as digit 0,
+    and low scores for any other digit. Optionally combines with quality reward
+    to ensure the digit 0 is also high quality.
+    
+    Pros:
+    - Strongly encourages digit 0 generation
+    - Can combine with quality metrics for better results
+    - Clear optimization signal
+    
+    Cons:
+    - Only generates one digit (mode collapse)
+    - May ignore other digits in training data
+    
+    Usage:
+        reward_fn = MNISTDigitZeroReward(device='cuda', use_quality=True)
+        rewards = reward_fn(images, prompts)
+    """
+    
+    def __init__(self, device='cuda', use_quality=True, quality_weight=0.2):
+        """
+        Args:
+            device: Device to run on
+            use_quality: Whether to combine with quality reward (default True)
+            quality_weight: Weight for quality reward when combined (default 0.2)
+        """
+        self.device = device
+        self.use_quality = use_quality
+        self.quality_weight = quality_weight
+        
+        # Initialize classifier for digit classification
+        self.classifier_reward = MNISTClassifierReward(device=device)
+        
+        # Optionally use quality reward
+        if use_quality:
+            self.quality_reward = MNISTQualityReward(device=device)
+            self.digit_weight = 1.0 - quality_weight
+        else:
+            self.quality_reward = None
+            self.digit_weight = 1.0
+    
+    def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
+        """
+        Compute rewards for digit 0 generation.
+        
+        Args:
+            images: Generated images [batch_size, C, H, W] or [batch_size, H, W]
+            prompts: List of prompt strings (ignored, always rewards digit 0)
+        
+        Returns:
+            rewards: Tensor of rewards [batch_size] in range [0, 1]
+        """
+        batch_size = images.shape[0]
+        
+        # Preprocess images (same as classifier)
+        if images.dim() == 3:  # [B, H, W] -> [B, 1, H, W]
+            images = images.unsqueeze(1)
+        if images.shape[1] == 3:  # RGB -> Grayscale
+            images = images.mean(dim=1, keepdim=True)
+        
+        # Resize to 28x28 if needed
+        if images.shape[-1] != 28:
+            images = F.interpolate(images, size=(28, 28), mode='bilinear', align_corners=False)
+        
+        # Normalize for classifier
+        images_norm = (images - 0.1307) / 0.3081
+        
+        # Classify images
+        with torch.no_grad():
+            logits = self.classifier_reward.classifier(images_norm)
+            probs = F.softmax(logits, dim=1)
+            predicted_digits = logits.argmax(dim=1)
+        
+        # Reward based on probability of digit 0
+        digit_zero_probs = probs[:, 0]  # Probability of being digit 0
+        
+        # Strong reward signal: high reward for digit 0, very low for others
+        # Use the probability directly, which gives smooth gradient
+        digit_rewards = digit_zero_probs
+        
+        # Optionally combine with quality reward
+        if self.use_quality and self.quality_reward is not None:
+            quality_rewards = self.quality_reward(images, prompts, **kwargs)
+            # Combine: mostly digit 0 probability, some quality
+            combined_rewards = (self.digit_weight * digit_rewards + 
+                              self.quality_weight * quality_rewards)
+        else:
+            combined_rewards = digit_rewards
+        
+        # Ensure rewards are in [0, 1] range
+        combined_rewards = torch.clamp(combined_rewards, 0.0, 1.0)
+        
+        return combined_rewards
+
+
 # Example usage and recommended configurations
 
-def get_recommended_reward_config(config_name: str = 'balanced', device: str = 'cuda'):
+def get_recommended_reward_config(config_name: str = 'digit_zero', device: str = 'cuda'):
     """
     Get recommended reward configurations for different training objectives.
     
     Configurations:
+    - 'digit_zero': Reward for generating only digit 0 (default)
     - 'accuracy': Focus on classification accuracy
     - 'quality': Focus on visual quality
-    - 'balanced': Balance between accuracy and quality (recommended)
+    - 'balanced': Balance between accuracy and quality
     - 'diverse': Include diversity reward
     """
     configs = {
+        'digit_zero': MNISTDigitZeroReward(
+            device=device,
+            use_quality=True,
+            quality_weight=0.2,  # 80% digit 0 probability, 20% quality
+        ),
         'accuracy': CombinedMNISTReward(
             device=device,
             weights={
@@ -1498,4 +1602,4 @@ def get_recommended_reward_config(config_name: str = 'balanced', device: str = '
         ),
     }
     
-    return configs.get(config_name, configs['balanced'])
+    return configs.get(config_name, configs['digit_zero'])

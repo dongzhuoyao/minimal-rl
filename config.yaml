@@ -34,7 +34,7 @@ resume_from: null  # Path to checkpoint to resume training from (loads optimizer
 
 # Reward configuration
 reward:
-  config: "balanced"  # Reward config: 'accuracy', 'quality', 'balanced', 'diverse'
+  config: "digit_zero"  # Reward config: 'digit_zero' (default, generates only 0), 'accuracy', 'quality', 'balanced', 'diverse'
 
 # Dataset configuration
 dataset:
