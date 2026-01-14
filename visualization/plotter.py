@@ -79,10 +79,48 @@ class TrainingPlotter:
         plt.close()
     
     def _plot_samples(self, signals, prompts, epoch, eval_stats=None):
-        """Plot generated signal samples."""
+        """Plot generated signal samples (MNIST images)."""
         if isinstance(signals, torch.Tensor):
             signals = signals.cpu().numpy()
         
+        # Handle both 1D (flattened) and 2D (image) signals
+        if signals.ndim == 2:
+            # Check if it's flattened MNIST (784) or 2D images
+            if signals.shape[1] == 784:
+                # Reshape from [batch, 784] to [batch, 28, 28]
+                signals = signals.reshape(-1, 28, 28)
+            elif signals.shape[1] != 28:
+                # Assume it's 1D signal, plot as line graph
+                num_samples = min(len(signals), 8)
+                fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+                axes = axes.flatten()
+                
+                rewards_list = eval_stats.get("rewards", []) if eval_stats else []
+                
+                for i in range(num_samples):
+                    signal = signals[i]
+                    prompt = prompts[i] if i < len(prompts) else f"Sample {i}"
+                    
+                    axes[i].plot(signal, "b-", linewidth=2)
+                    if i < len(rewards_list):
+                        axes[i].set_title(f"{prompt}\nReward: {rewards_list[i]:.3f}")
+                    else:
+                        axes[i].set_title(prompt)
+                    axes[i].set_xlabel("Position")
+                    axes[i].set_ylabel("Value")
+                    axes[i].grid(True, alpha=0.3)
+                
+                # Hide unused subplots
+                for i in range(num_samples, len(axes)):
+                    axes[i].axis("off")
+                
+                plt.suptitle(f"Generated Samples - Epoch {epoch}", fontsize=16)
+                plt.tight_layout()
+                plt.savefig(self.output_dir / f"samples_epoch_{epoch}.png", dpi=150)
+                plt.close()
+                return
+        
+        # Plot as 2D images (MNIST)
         num_samples = min(len(signals), 8)
         fig, axes = plt.subplots(2, 4, figsize=(16, 8))
         axes = axes.flatten()
@@ -90,23 +128,26 @@ class TrainingPlotter:
         rewards_list = eval_stats.get("rewards", []) if eval_stats else []
         
         for i in range(num_samples):
-            signal = signals[i]
+            image = signals[i]
             prompt = prompts[i] if i < len(prompts) else f"Sample {i}"
             
-            axes[i].plot(signal, "b-", linewidth=2)
+            # Denormalize if needed (MNIST normalization: mean=0.1307, std=0.3081)
+            # For visualization, we'll use sigmoid to map to [0, 1]
+            if image.min() < 0 or image.max() > 1:
+                image = 1 / (1 + np.exp(-image))  # Sigmoid to [0, 1]
+            
+            axes[i].imshow(image, cmap="gray", vmin=0, vmax=1)
             if i < len(rewards_list):
-                axes[i].set_title(f"{prompt}\nReward: {rewards_list[i]:.3f}")
+                axes[i].set_title(f"Label: {prompt}\nReward: {rewards_list[i]:.3f}")
             else:
-                axes[i].set_title(prompt)
-            axes[i].set_xlabel("Position")
-            axes[i].set_ylabel("Value")
-            axes[i].grid(True, alpha=0.3)
+                axes[i].set_title(f"Label: {prompt}")
+            axes[i].axis("off")
         
         # Hide unused subplots
         for i in range(num_samples, len(axes)):
             axes[i].axis("off")
         
-        plt.suptitle(f"Generated Samples - Epoch {epoch}", fontsize=16)
+        plt.suptitle(f"Generated MNIST Samples - Epoch {epoch}", fontsize=16)
         plt.tight_layout()
         plt.savefig(self.output_dir / f"samples_epoch_{epoch}.png", dpi=150)
         plt.close()

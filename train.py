@@ -7,7 +7,7 @@ Usage:
     python train.py training=gpu            # Use GPU config
     python train.py model=large              # Use large model
     python train.py training.num_epochs=100 # Override specific parameter
-    python train.py training.batch_size=8 training.learning_rate=0.0005  # Override multiple
+    python train.py training.batch_size=8 training.lr=0.0005  # Override multiple
 """
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -18,8 +18,7 @@ import sys
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from dataset.dataset import PromptDataset
-from dataset.generate_dataset import generate_dataset
+from dataset import MNISTDataset
 from models.toy_flow_model import create_toy_model
 from rewards.simple_reward import SimpleReward
 from training.trainer import FlowGRPOTrainer
@@ -48,16 +47,11 @@ def main(cfg: DictConfig):
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
-    # Generate dataset if needed
+    # Load MNIST datasets
+    print("Loading MNIST datasets...")
     dataset_dir = Path(cfg.dataset.dataset_dir)
-    if not (dataset_dir / "train.txt").exists():
-        print("Generating dataset...")
-        generate_dataset()
-    
-    # Load datasets
-    print("Loading datasets...")
-    train_dataset = PromptDataset(dataset_dir, split="train")
-    test_dataset = PromptDataset(dataset_dir, split="test")
+    train_dataset = MNISTDataset(dataset_dir, split="train", download=True)
+    test_dataset = MNISTDataset(dataset_dir, split="test", download=True)
     
     print(f"Train samples: {len(train_dataset)}")
     print(f"Test samples: {len(test_dataset)}")

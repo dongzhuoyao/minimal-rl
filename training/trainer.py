@@ -45,7 +45,7 @@ class FlowGRPOTrainer:
         # Setup optimizer
         self.optimizer = torch.optim.Adam(
             list(model.parameters()) + list(prompt_encoder.parameters()),
-            lr=config.get("learning_rate", 1e-3),
+            lr=config.get("lr", 1e-3),
         )
         
         # Setup device
@@ -60,50 +60,60 @@ class FlowGRPOTrainer:
         self.epoch = 0
         self.step = 0
     
-    def encode_prompts(self, prompts):
-        """Encode text prompts to embeddings."""
-        # Simple tokenization: map words to IDs
-        # In practice, you'd use a proper tokenizer
-        vocab = {
-            "a": 0, "red": 1, "blue": 2, "green": 3, "yellow": 4,
-            "circle": 5, "square": 6, "triangle": 7,
-            "small": 8, "large": 9, "purple": 10, "orange": 11,
-            "pink": 12, "cyan": 13, "magenta": 14,
-        }
+    def encode_prompts(self, labels):
+        """Encode digit labels to embeddings."""
+        # Convert labels to tensor if needed
+        if isinstance(labels, (list, tuple)):
+            if isinstance(labels[0], str):
+                # Convert string labels to integers
+                labels = torch.tensor([int(l) for l in labels], device=self.device, dtype=torch.long)
+            else:
+                labels = torch.tensor(labels, device=self.device, dtype=torch.long)
+        elif isinstance(labels, torch.Tensor):
+            labels = labels.to(self.device).long()
+        else:
+            labels = torch.tensor([int(labels)], device=self.device, dtype=torch.long)
         
-        batch_size = len(prompts)
-        max_len = 10
+        # Ensure labels are in valid range [0, 9]
+        labels = labels.clamp(0, 9)
         
-        prompt_ids = torch.zeros(batch_size, max_len, dtype=torch.long, device=self.device)
-        
-        for i, prompt in enumerate(prompts):
-            words = prompt.lower().split()
-            for j, word in enumerate(words[:max_len]):
-                prompt_ids[i, j] = vocab.get(word, 0)
-        
-        return self.prompt_encoder(prompt_ids)
+        return self.prompt_encoder(labels)
     
-    def sample_trajectories(self, prompts, num_samples_per_prompt=4):
+    def sample_trajectories(self, labels, num_samples_per_prompt=4):
         """
         Sample trajectories from the current policy.
         
         Args:
-            prompts: List of prompt strings
+            labels: Tensor or list of digit labels (0-9)
             num_samples_per_prompt: Number of samples per prompt
         
         Returns:
             samples: Dict containing trajectories, log_probs, etc.
         """
-        # Expand prompts
-        expanded_prompts = []
+        # Convert labels to tensor if needed
+        # Labels from DataLoader batch are already tensors
+        if isinstance(labels, torch.Tensor):
+            # Convert tensor to list of integers
+            labels = labels.cpu().tolist()
+        
+        if isinstance(labels, (list, tuple)):
+            # Ensure all elements are integers
+            labels = [int(l) for l in labels]
+        else:
+            labels = [int(labels)]
+        
+        # Expand labels
+        expanded_labels = []
         prompt_ids = []
-        for i, prompt in enumerate(prompts):
+        for i, label in enumerate(labels):
             for _ in range(num_samples_per_prompt):
-                expanded_prompts.append(prompt)
+                expanded_labels.append(label)
                 prompt_ids.append(i)
         
-        # Encode prompts
-        prompt_embeds = self.encode_prompts(expanded_prompts)
+        expanded_labels = torch.tensor(expanded_labels, device=self.device, dtype=torch.long)
+        
+        # Encode labels
+        prompt_embeds = self.encode_prompts(expanded_labels)
         
         # Sample trajectories
         self.model.eval()
@@ -118,13 +128,13 @@ class FlowGRPOTrainer:
         final_signals = trajectory[-1]
         
         # Compute rewards
-        rewards = self.reward_fn(final_signals, expanded_prompts)
+        rewards = self.reward_fn(final_signals, expanded_labels)
         
         return {
             "trajectory": trajectory,
             "log_probs": log_probs,
             "rewards": rewards,
-            "prompts": expanded_prompts,
+            "labels": expanded_labels,
             "prompt_ids": torch.tensor(prompt_ids, device=self.device),
             "final_signals": final_signals,
         }
@@ -145,11 +155,11 @@ class FlowGRPOTrainer:
         epoch_rewards = []
         
         for batch in tqdm(dataloader, desc=f"Epoch {self.epoch}"):
-            prompts = batch["prompt"]
+            labels = batch["label"]
             
             # Sample trajectories
             samples = self.sample_trajectories(
-                prompts,
+                labels,
                 num_samples_per_prompt=self.config.get("num_samples_per_prompt", 4),
             )
             
@@ -176,11 +186,11 @@ class FlowGRPOTrainer:
                 advantages_step = advantages_expanded[:, step_idx]
                 
                 # Recompute log probs with current policy
-                prompt_embeds = self.encode_prompts(samples["prompts"])
+                prompt_embeds = self.encode_prompts(samples["labels"])
                 
                 # Get state at this step
                 x = samples["trajectory"][step_idx]
-                t = torch.ones(len(samples["prompts"]), 1, device=self.device) * (
+                t = torch.ones(len(samples["labels"]), 1, device=self.device) * (
                     step_idx / num_steps
                 )
                 
@@ -250,10 +260,10 @@ class FlowGRPOTrainer:
         
         with torch.no_grad():
             for batch in test_loader:
-                prompts = batch["prompt"]
+                labels = batch["label"]
                 
-                # Sample single trajectory per prompt
-                prompt_embeds = self.encode_prompts(prompts)
+                # Sample single trajectory per label
+                prompt_embeds = self.encode_prompts(labels)
                 trajectory, _ = self.model.sample(
                     prompt_embeds,
                     num_steps=self.config.get("eval_num_steps", 20),
@@ -261,7 +271,7 @@ class FlowGRPOTrainer:
                 )
                 
                 final_signals = trajectory[-1]
-                rewards = self.reward_fn(final_signals, prompts)
+                rewards = self.reward_fn(final_signals, labels)
                 
                 all_rewards.extend(rewards.cpu().numpy())
                 all_signals.append(final_signals.cpu())
@@ -291,11 +301,13 @@ class FlowGRPOTrainer:
                 print(f"Test Reward: {eval_stats['mean_reward']:.4f}")
                 
                 # Visualize
+                # Reshape signals from [batch, 784] to [batch, 28, 28] for visualization
+                signals_reshaped = eval_stats["signals"][:8].view(-1, 28, 28)
                 self.plotter.update(
                     epoch,
                     train_stats,
                     eval_stats,
-                    eval_stats["signals"][:8],  # Show first 8 samples
+                    signals_reshaped,  # Show first 8 samples as 28x28 images
                     eval_stats["prompts"][:8],
                 )
             else:

@@ -96,34 +96,36 @@ class SimpleFlowModel(nn.Module):
 
 
 class PromptEncoder(nn.Module):
-    """Simple prompt encoder that maps text prompts to embeddings."""
+    """Simple prompt encoder that maps digit labels to embeddings."""
     
-    def __init__(self, vocab_size=20, embed_dim=32):
+    def __init__(self, vocab_size=10, embed_dim=32):
         """
         Args:
-            vocab_size: Number of unique words in vocabulary
+            vocab_size: Number of digits (0-9)
             embed_dim: Embedding dimension
         """
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.pool = nn.AdaptiveAvgPool1d(1)
     
     def forward(self, prompt_ids):
         """
-        Encode prompt IDs to embeddings.
+        Encode digit labels to embeddings.
         
         Args:
-            prompt_ids: Token IDs [batch_size, seq_len]
+            prompt_ids: Digit labels [batch_size] or [batch_size, 1]
         
         Returns:
             embeddings: [batch_size, embed_dim]
         """
-        # Simple average pooling
-        embeds = self.embedding(prompt_ids)  # [batch_size, seq_len, embed_dim]
-        return embeds.mean(dim=1)  # [batch_size, embed_dim]
+        # Handle both [batch_size] and [batch_size, 1] shapes
+        if prompt_ids.dim() > 1:
+            prompt_ids = prompt_ids.squeeze(-1)
+        # Ensure prompt_ids are in valid range [0, vocab_size-1]
+        prompt_ids = prompt_ids.clamp(0, self.embedding.num_embeddings - 1)
+        return self.embedding(prompt_ids)  # [batch_size, embed_dim]
 
 
-def create_toy_model(signal_dim=64, prompt_dim=32, hidden_dim=128, vocab_size=20):
+def create_toy_model(signal_dim=784, prompt_dim=32, hidden_dim=256, vocab_size=10):
     """Create a toy flow model and prompt encoder."""
     model = SimpleFlowModel(signal_dim, prompt_dim, hidden_dim)
     encoder = PromptEncoder(vocab_size, prompt_dim)

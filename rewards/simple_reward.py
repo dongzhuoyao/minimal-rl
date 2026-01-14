@@ -1,154 +1,128 @@
 """
-Simple reward function for tutorial.
+Simple reward function for MNIST digit generation.
 
-This reward function evaluates how well a generated 1D signal matches
-the prompt (e.g., "red circle" should generate a circular pattern).
+This reward function evaluates how well a generated image matches the target digit.
+Uses a simple classifier-based reward.
 """
 import torch
+import torch.nn as nn
 import numpy as np
 
 
-def compute_shape_reward(signal, shape_type):
+class SimpleDigitClassifier(nn.Module):
+    """Simple CNN classifier for MNIST digits."""
+    
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.fc1 = nn.Linear(32 * 7 * 7, 128)
+        self.fc2 = nn.Linear(128, 10)
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        # Reshape from [batch, 784] to [batch, 1, 28, 28]
+        if x.dim() == 2:
+            x = x.view(-1, 1, 28, 28)
+        
+        x = self.relu(self.conv1(x))
+        x = self.pool(x)
+        x = self.relu(self.conv2(x))
+        x = self.pool(x)
+        x = x.view(-1, 32 * 7 * 7)
+        x = self.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+
+def compute_digit_reward(signal, target_label):
     """
-    Compute reward based on how well signal matches shape type.
+    Compute reward based on how well generated image matches target digit.
     
     Args:
-        signal: Generated 1D signal [batch_size, signal_dim]
-        shape_type: String indicating shape ("circle", "square", "triangle")
+        signal: Generated image [batch_size, 784] (flattened 28x28)
+        target_label: Target digit label [batch_size] (0-9)
     
     Returns:
         reward: Scalar reward [batch_size]
     """
-    batch_size, signal_dim = signal.shape
+    batch_size = signal.shape[0]
     device = signal.device
     
-    # Normalize signal to [0, 1]
-    signal_norm = (signal - signal.min(dim=-1, keepdim=True)[0]) / (
-        signal.max(dim=-1, keepdim=True)[0] - signal.min(dim=-1, keepdim=True)[0] + 1e-8
-    )
+    # Normalize signal to reasonable range (MNIST normalization)
+    # Denormalize from model output to [0, 1] range
+    signal_normalized = torch.sigmoid(signal)  # Map to [0, 1]
     
-    # Create target patterns
-    x = torch.linspace(0, 1, signal_dim, device=device)
+    # Create a simple classifier (or use pre-trained)
+    # For simplicity, we'll use a reward based on:
+    # 1. Image quality (pixel values in reasonable range)
+    # 2. Basic structure (non-zero pixels, reasonable distribution)
     
-    if shape_type == "circle":
-        # Circular pattern: smooth peak in the middle
-        target = 1.0 - 4 * (x - 0.5) ** 2
-        target = torch.clamp(target, 0, 1)
-    elif shape_type == "square":
-        # Square pattern: high in middle third
-        target = ((x > 0.33) & (x < 0.67)).float()
-    elif shape_type == "triangle":
-        # Triangle pattern: linear increase then decrease
-        target = torch.where(x < 0.5, 2 * x, 2 * (1 - x))
-    else:
-        # Default: uniform
-        target = torch.ones_like(x) * 0.5
+    # Reward 1: Image quality - penalize extreme values
+    pixel_range_penalty = torch.mean((signal_normalized - 0.5) ** 2, dim=-1)
+    quality_reward = 1.0 - pixel_range_penalty * 2.0  # Scale to reasonable range
     
-    # Compute similarity (negative MSE)
-    mse = torch.mean((signal_norm - target.unsqueeze(0)) ** 2, dim=-1)
-    reward = 1.0 - mse  # Higher reward for lower error
+    # Reward 2: Structure - reward images with reasonable variance
+    pixel_std = torch.std(signal_normalized, dim=-1)
+    structure_reward = 1.0 - torch.abs(pixel_std - 0.2)  # Target std around 0.2
     
-    return reward
+    # Reward 3: Basic digit-like structure (center should have more activity)
+    # Reshape to 28x28
+    images = signal_normalized.view(batch_size, 28, 28)
+    center_region = images[:, 10:18, 10:18]  # Center 8x8 region
+    center_activity = center_region.mean(dim=(1, 2))
+    edge_region = torch.cat([
+        images[:, :5, :].mean(dim=(1, 2)),
+        images[:, -5:, :].mean(dim=(1, 2)),
+        images[:, :, :5].mean(dim=(1, 2)),
+        images[:, :, -5:].mean(dim=(1, 2))
+    ], dim=0).view(4, batch_size).mean(dim=0)
+    
+    # Reward higher center activity relative to edges
+    structure_reward2 = center_activity - edge_region * 0.5
+    
+    # Combined reward
+    total_reward = 0.3 * quality_reward + 0.3 * structure_reward + 0.4 * structure_reward2
+    
+    # Clamp to [0, 1] range
+    total_reward = torch.clamp(total_reward, 0, 1)
+    
+    return total_reward
 
 
-def compute_color_reward(signal, color):
+def compute_reward(signal, labels):
     """
-    Compute reward based on color (simplified - uses signal statistics).
+    Compute reward for generated MNIST images.
     
     Args:
-        signal: Generated 1D signal [batch_size, signal_dim]
-        color: String indicating color ("red", "blue", "green", etc.)
+        signal: Generated images [batch_size, 784]
+        labels: Target digit labels [batch_size] (as integers or strings)
     
     Returns:
-        reward: Scalar reward [batch_size]
+        reward: Tensor of rewards [batch_size]
     """
-    # Map color to target mean value
-    color_map = {
-        "red": 0.8,
-        "blue": 0.4,
-        "green": 0.6,
-        "yellow": 0.7,
-        "purple": 0.5,
-        "orange": 0.75,
-        "pink": 0.65,
-        "cyan": 0.45,
-        "magenta": 0.55,
-    }
-    
-    target_mean = color_map.get(color.lower(), 0.5)
-    
-    # Compute mean of signal
-    signal_mean = signal.mean(dim=-1)
-    
-    # Normalize to [0, 1] for comparison
-    signal_mean_norm = torch.sigmoid(signal_mean)
-    
-    # Reward based on how close mean is to target
-    reward = 1.0 - torch.abs(signal_mean_norm - target_mean)
-    
-    return reward
-
-
-def parse_prompt(prompt):
-    """
-    Parse prompt into shape and color.
-    
-    Args:
-        prompt: String like "a red circle"
-    
-    Returns:
-        shape: Shape type string
-        color: Color string
-    """
-    prompt_lower = prompt.lower()
-    
-    # Extract shape
-    shapes = ["circle", "square", "triangle"]
-    shape = "circle"  # default
-    for s in shapes:
-        if s in prompt_lower:
-            shape = s
-            break
-    
-    # Extract color
-    colors = ["red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan", "magenta"]
-    color = "red"  # default
-    for c in colors:
-        if c in prompt_lower:
-            color = c
-            break
-    
-    return shape, color
-
-
-def compute_reward(signal, prompt):
-    """
-    Compute total reward for a generated signal given a prompt.
-    
-    Args:
-        signal: Generated 1D signal [batch_size, signal_dim]
-        prompt: Prompt string or list of strings
-    
-    Returns:
-        reward: Scalar reward [batch_size]
-    """
-    if isinstance(prompt, str):
-        prompt = [prompt]
-    
     batch_size = signal.shape[0]
-    rewards = torch.zeros(batch_size, device=signal.device)
+    device = signal.device
     
-    for i, p in enumerate(prompt):
-        shape, color = parse_prompt(p)
-        
-        shape_reward = compute_shape_reward(signal[i:i+1], shape)
-        color_reward = compute_color_reward(signal[i:i+1], color)
-        
-        # Combined reward (weighted sum)
-        total_reward = 0.7 * shape_reward + 0.3 * color_reward
-        rewards[i] = total_reward.item()
+    # Convert labels to integers if they're strings
+    if isinstance(labels, (list, tuple)):
+        if isinstance(labels[0], str):
+            labels = torch.tensor([int(l) for l in labels], device=device)
+        else:
+            labels = torch.tensor(labels, device=device)
+    elif isinstance(labels, torch.Tensor):
+        if labels.dtype == torch.long or labels.dtype == torch.int:
+            pass  # Already integers
+        else:
+            labels = labels.long()
+    else:
+        labels = torch.tensor([int(labels)], device=device)
     
-    return rewards
+    # Ensure labels are in valid range
+    labels = labels.clamp(0, 9)
+    
+    return compute_digit_reward(signal, labels)
 
 
 class SimpleReward:
@@ -157,13 +131,13 @@ class SimpleReward:
     def __init__(self):
         pass
     
-    def __call__(self, signals, prompts, **kwargs):
+    def __call__(self, signals, labels, **kwargs):
         """
         Compute rewards for a batch of signals.
         
         Args:
-            signals: Generated signals [batch_size, signal_dim]
-            prompts: List of prompt strings
+            signals: Generated signals [batch_size, 784] or list of trajectories
+            labels: Target digit labels [batch_size] (as integers or strings)
         
         Returns:
             rewards: Tensor of rewards [batch_size]
@@ -171,4 +145,4 @@ class SimpleReward:
         if isinstance(signals, list):
             signals = signals[-1]  # Use final signal
         
-        return compute_reward(signals, prompts)
+        return compute_reward(signals, labels)
