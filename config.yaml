@@ -29,7 +29,7 @@ training:
   save_freq: 1000  # Frequency of checkpoint saving (in steps)
 
 # Checkpoint configuration
-pretrained_checkpoint: "outputs/flow_matching/best_model.pt"  # Path to pretrained checkpoint from train0.py
+pretrained_checkpoint: "best_model.pt"  # Path to pretrained checkpoint
 resume_from: null  # Path to checkpoint to resume training from (loads optimizer state too)
 
 # Reward configuration

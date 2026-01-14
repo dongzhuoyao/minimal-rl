@@ -3,3 +3,5 @@ tutorial/__pycache__/
 __pycache__
 tutorial/outputs/example_signals.png
 outputs/
+best_model.pt
+best_model.pt

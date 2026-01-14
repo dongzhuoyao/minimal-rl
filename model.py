@@ -180,10 +180,10 @@ class SimpleUNet(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-class MNISTFlowModel(nn.Module):
+class MNISTFlowModel(SimpleUNet):
     """
     Flow matching model wrapper for MNIST that works directly with labels.
-    No prompt encoder needed - uses labels directly.
+    Inherits from SimpleUNet to reuse UNet components without "unet." prefix.
     """
     
     def __init__(self, signal_dim=784, time_emb_dim=40, vocab_size=10):
@@ -193,7 +193,12 @@ class MNISTFlowModel(nn.Module):
             time_emb_dim: Dimension of time embeddings
             vocab_size: Number of classes (10 for MNIST digits 0-9)
         """
-        super().__init__()
+        # Initialize SimpleUNet with appropriate parameters
+        super().__init__(
+            img_channels=1,
+            label_dim=vocab_size,
+            time_emb_dim=time_emb_dim,
+        )
         self.signal_dim = signal_dim
         self.vocab_size = vocab_size
         
@@ -201,13 +206,6 @@ class MNISTFlowModel(nn.Module):
         self.img_size = int(np.sqrt(signal_dim))
         assert self.img_size * self.img_size == signal_dim, \
             f"signal_dim must be a perfect square, got {signal_dim}"
-        
-        # Use SimpleUNet directly
-        self.unet = SimpleUNet(
-            img_channels=1,
-            label_dim=vocab_size,
-            time_emb_dim=time_emb_dim,
-        )
     
     def forward(self, x, t, labels):
         """
@@ -233,8 +231,8 @@ class MNISTFlowModel(nn.Module):
         max_inv_rho = sigma_max ** (1 / rho)
         sigma = (max_inv_rho + t_flat * (min_inv_rho - max_inv_rho)) ** rho
         
-        # Use SimpleUNet directly with labels
-        output = self.unet(x_img, sigma, labels)
+        # Call SimpleUNet's forward method
+        output = super().forward(x_img, sigma, labels)
         
         # Flatten output back to signal dimension
         v = output.view(B, self.signal_dim)

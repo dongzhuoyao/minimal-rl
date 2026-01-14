@@ -263,19 +263,11 @@ def main(cfg: DictConfig):
     model.to(device)
     
     # Load pretrained checkpoint
-    checkpoint_path = cfg.pretrained_checkpoint
-    if checkpoint_path is None:
-        # Default to checkpoint from train0.py
-        checkpoint_path = "outputs/flow_matching/best_model.pt"
-    
+    checkpoint_path = cfg.pretrained_checkpoint or "best_model.pt"
     if os.path.exists(checkpoint_path):
         print(f"Loading pretrained checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        # Handle different checkpoint formats
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            model.load_state_dict(checkpoint)
+        model.load_state_dict(checkpoint['model_state_dict'])
         print("Checkpoint loaded successfully!")
     else:
         print(f"Warning: Checkpoint not found at {checkpoint_path}. Starting from scratch.")
