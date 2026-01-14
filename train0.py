@@ -10,6 +10,7 @@ Usage:
     python train0.py training.lr=0.0005      # Override learning rate
 """
 import hydra
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
 import torch
@@ -18,12 +19,13 @@ from torch.utils.data import DataLoader
 import sys
 from tqdm import tqdm
 import os
+import wandb
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dataset import MNISTDataset
-from models.toy_flow_model import create_toy_model
+from model import SimpleUNet
 
 
 @hydra.main(version_base=None, config_path=".", config_name="config0")
@@ -36,6 +38,30 @@ def main(cfg: DictConfig):
     print("=" * 60)
     print(OmegaConf.to_yaml(cfg))
     print("=" * 60)
+    
+    # Initialize wandb
+    if cfg.wandb.enabled:
+        # Get Hydra's output directory using HydraConfig
+        hydra_cfg = HydraConfig.get()
+        hydra_output_dir = Path(hydra_cfg.run.dir)
+        wandb_dir = hydra_output_dir / "wandb"
+        
+        # Set WANDB_DIR environment variable to ensure wandb uses this directory
+        os.environ["WANDB_DIR"] = str(wandb_dir)
+        
+        # Create the directory if it doesn't exist
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+        
+        wandb.init(
+            project=cfg.wandb.project,
+            name=cfg.wandb.run_name if cfg.wandb.run_name else cfg.run_name,
+            config=OmegaConf.to_container(cfg, resolve=True),
+            tags=cfg.wandb.get("tags", []),
+            dir=str(wandb_dir),  # Explicitly set wandb directory to Hydra's output
+        )
+        print(f"Wandb initialized: {wandb.run.url}")
+        print(f"Wandb directory: {wandb_dir}")
+        print(f"Hydra output directory: {hydra_output_dir}")
     
     # Set random seed
     if hasattr(cfg, 'seed'):
@@ -64,19 +90,32 @@ def main(cfg: DictConfig):
     print(f"Test samples: {len(test_dataset)}")
     
     # Create model
-    print("Creating model...")
-    model, prompt_encoder = create_toy_model(
-        signal_dim=cfg.model.signal_dim,
-        prompt_dim=cfg.model.prompt_dim,
-        hidden_dim=cfg.model.hidden_dim,
-        vocab_size=cfg.model.vocab_size,
+    print("Creating UNet model...")
+    model = SimpleUNet(
+        img_channels=1,  # MNIST is grayscale
+        label_dim=cfg.model.vocab_size,  # 10 classes (digits 0-9)
+        time_emb_dim=cfg.model.get("time_emb_dim", 128),
     )
     model.to(device)
-    prompt_encoder.to(device)
+    
+    # Count parameters
+    def count_parameters(model):
+        """Count the number of trainable parameters in a model."""
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    total_params = count_parameters(model)
+    
+    print(f"Total parameters: {total_params:,}")
+    
+    # Log parameter count to wandb config
+    if cfg.wandb.enabled:
+        wandb.config.update({
+            "model/num_parameters": total_params,
+        })
     
     # Setup optimizer
     optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(prompt_encoder.parameters()),
+        model.parameters(),
         lr=cfg.training.lr,
     )
     
@@ -110,7 +149,6 @@ def main(cfg: DictConfig):
     while step < cfg.training.num_steps:
         # Training phase
         model.train()
-        prompt_encoder.train()
         
         try:
             batch = next(train_iter)
@@ -119,30 +157,35 @@ def main(cfg: DictConfig):
             train_iter = iter(train_loader)
             batch = next(train_iter)
         
-        images = batch["image"].to(device)  # [batch_size, 784]
+        images_flat = batch["image"].to(device)  # [batch_size, 784]
         labels = batch["label"].to(device)  # [batch_size]
         
-        # Encode prompts
-        prompt_embeds = prompt_encoder(labels)  # [batch_size, prompt_dim]
+        # Reshape images from [batch_size, 784] to [batch_size, 1, 28, 28]
+        images = images_flat.view(-1, 1, 28, 28)
         
         # Flow matching loss computation
         batch_size = images.shape[0]
         
         # Sample random time t uniformly from [0, 1]
-        t = torch.rand(batch_size, 1, device=device)  # [batch_size, 1]
+        t = torch.rand(batch_size, device=device)  # [batch_size]
+        
+        # Convert time to sigma (noise level) for UNet
+        # Using sigma_max = 80.0 (from model.py default)
+        sigma_max = cfg.model.get("sigma_max", 80.0)
+        sigma = t * sigma_max  # [batch_size]
         
         # Sample noise x_1 ~ N(0, I)
-        noise = torch.randn_like(images)  # [batch_size, 784]
+        noise = torch.randn_like(images)  # [batch_size, 1, 28, 28]
         
         # Interpolate: x_t = (1-t) * x_0 + t * x_1
         # where x_0 = data (images) and x_1 = noise
-        x_t = (1 - t) * images + t * noise  # [batch_size, 784]
+        x_t = (1 - t.view(-1, 1, 1, 1)) * images + t.view(-1, 1, 1, 1) * noise  # [batch_size, 1, 28, 28]
         
         # Target velocity: v_target = x_1 - x_0 = noise - images
-        v_target = noise - images  # [batch_size, 784]
+        v_target = noise - images  # [batch_size, 1, 28, 28]
         
-        # Predict velocity: v_pred = model(x_t, t, prompt_embed)
-        v_pred = model(x_t, t, prompt_embeds)  # [batch_size, 784]
+        # Predict velocity: v_pred = model(x_t, sigma, label)
+        v_pred = model(x_t, sigma, labels)  # [batch_size, 1, 28, 28]
         
         # Flow matching loss: L = ||v_pred - v_target||^2
         loss = nn.functional.mse_loss(v_pred, v_target, reduction='mean')
@@ -151,12 +194,26 @@ def main(cfg: DictConfig):
         optimizer.zero_grad()
         loss.backward()
         
+        # Compute gradient norm before clipping (if logging enabled)
+        grad_norm = 0.0
+        if cfg.wandb.enabled and cfg.wandb.get("log_grad_norm", False):
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            grad_norm = total_norm ** (1. / 2)
+        
         # Gradient clipping
+        clipped_norm = 0.0
         if cfg.training.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                list(model.parameters()) + list(prompt_encoder.parameters()),
+            clipped_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
                 cfg.training.max_grad_norm,
             )
+        elif cfg.wandb.enabled and cfg.wandb.get("log_grad_norm", False):
+            # If not clipping but logging, compute norm
+            clipped_norm = grad_norm
         
         optimizer.step()
         
@@ -166,6 +223,23 @@ def main(cfg: DictConfig):
         step += 1
         pbar.update(1)
         
+        # Log to wandb
+        log_freq = cfg.wandb.get("log_freq", 1)  # Default: log every step
+        if cfg.wandb.enabled and (step % log_freq == 0 or step == 1):
+            log_dict = {
+                "train/loss": loss.item(),
+                "train/running_loss": running_train_loss / loss_count,
+                "train/learning_rate": optimizer.param_groups[0]['lr'],
+                "step": step,
+            }
+            
+            # Add gradient metrics if enabled
+            if cfg.wandb.get("log_grad_norm", False):
+                log_dict["train/grad_norm"] = grad_norm
+                log_dict["train/clipped_grad_norm"] = clipped_norm.item() if isinstance(clipped_norm, torch.Tensor) else clipped_norm
+            
+            wandb.log(log_dict, step=step)
+        
         # Evaluation phase
         if step % cfg.training.eval_freq == 0:
             avg_train_loss = running_train_loss / loss_count
@@ -173,31 +247,51 @@ def main(cfg: DictConfig):
             loss_count = 0
             
             model.eval()
-            prompt_encoder.eval()
             test_losses = []
             
             with torch.no_grad():
                 for batch in test_loader:
-                    images = batch["image"].to(device)
-                    labels = batch["label"].to(device)
+                    images_flat = batch["image"].to(device)  # [batch_size, 784]
+                    labels = batch["label"].to(device)  # [batch_size]
                     
-                    prompt_embeds = prompt_encoder(labels)
+                    # Reshape images from [batch_size, 784] to [batch_size, 1, 28, 28]
+                    images = images_flat.view(-1, 1, 28, 28)
                     
                     batch_size = images.shape[0]
-                    t = torch.rand(batch_size, 1, device=device)
+                    t = torch.rand(batch_size, device=device)
+                    
+                    # Convert time to sigma
+                    sigma_max = cfg.model.get("sigma_max", 80.0)
+                    sigma = t * sigma_max
+                    
                     noise = torch.randn_like(images)
-                    x_t = (1 - t) * images + t * noise
+                    x_t = (1 - t.view(-1, 1, 1, 1)) * images + t.view(-1, 1, 1, 1) * noise
                     v_target = noise - images
-                    v_pred = model(x_t, t, prompt_embeds)
+                    v_pred = model(x_t, sigma, labels)
                     
                     loss = nn.functional.mse_loss(v_pred, v_target, reduction='mean')
                     test_losses.append(loss.item())
             
             avg_test_loss = sum(test_losses) / len(test_losses)
             
+            # Compute additional metrics
+            test_loss_std = (sum((x - avg_test_loss) ** 2 for x in test_losses) / len(test_losses)) ** 0.5 if len(test_losses) > 1 else 0.0
+            
             print(f"\nStep {step}/{cfg.training.num_steps}")
             print(f"Train Loss: {avg_train_loss:.6f}")
-            print(f"Test Loss: {avg_test_loss:.6f}")
+            print(f"Test Loss: {avg_test_loss:.6f} ± {test_loss_std:.6f}")
+            
+            # Log to wandb
+            if cfg.wandb.enabled:
+                eval_log_dict = {
+                    "eval/train_loss": avg_train_loss,
+                    "eval/test_loss": avg_test_loss,
+                    "eval/test_loss_std": test_loss_std,
+                    "eval/best_test_loss": best_test_loss,
+                    "eval/learning_rate": optimizer.param_groups[0]['lr'],
+                    "step": step,
+                }
+                wandb.log(eval_log_dict, step=step)
             
             # Save checkpoint if best
             if avg_test_loss < best_test_loss:
@@ -205,12 +299,15 @@ def main(cfg: DictConfig):
                 checkpoint = {
                     'step': step,
                     'model_state_dict': model.state_dict(),
-                    'prompt_encoder_state_dict': prompt_encoder.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'test_loss': avg_test_loss,
                 }
                 torch.save(checkpoint, output_dir / 'best_model.pt')
                 print(f"Saved best model (test loss: {avg_test_loss:.6f})")
+                
+                # Log best test loss to wandb
+                if cfg.wandb.enabled:
+                    wandb.log({"eval/best_test_loss": best_test_loss}, step=step)
         
         # Update progress bar
         if step % 10 == 0:  # Update every 10 steps
@@ -221,6 +318,10 @@ def main(cfg: DictConfig):
     
     print(f"\nTraining complete! Best test loss: {best_test_loss:.6f}")
     print(f"Checkpoints saved in {output_dir}")
+    
+    # Finish wandb run
+    if cfg.wandb.enabled:
+        wandb.finish()
 
 
 if __name__ == "__main__":
