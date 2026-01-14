@@ -1,0 +1,7 @@
+# @package model
+
+# Larger model configuration
+signal_dim: 128
+prompt_dim: 64
+hidden_dim: 256
+vocab_size: 30

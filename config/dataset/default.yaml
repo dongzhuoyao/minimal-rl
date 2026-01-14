@@ -1,0 +1,5 @@
+# @package dataset
+
+# Dataset configuration
+dataset_dir: "dataset"
+split: "train"  # For dataset loading

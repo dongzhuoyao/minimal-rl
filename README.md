@@ -49,11 +49,45 @@ python -m dataset.generate_dataset
 
 3. Run training:
 ```bash
+# Use default configuration
 python train.py
+
+# Use different configs
+python train.py training=fast          # Fast training config
+python train.py training=gpu           # GPU-optimized config
+python train.py model=large            # Larger model
+
+# Override specific parameters
+python train.py training.num_epochs=100 training.batch_size=8
 ```
 
 4. View results:
 The training will generate visualizations in `outputs/` directory.
+
+## Configuration with Hydra
+
+This project uses [Hydra](https://hydra.cc/) for managing hyperparameters. All configuration files are in the `config/` directory.
+
+### Quick Examples
+
+```bash
+# Use default config
+python train.py
+
+# Use fast training (fewer epochs, smaller batches)
+python train.py training=fast
+
+# Use GPU config with larger model
+python train.py training=gpu model=large
+
+# Override specific parameters
+python train.py training.num_epochs=200 training.learning_rate=0.0005
+
+# Override multiple parameters
+python train.py training.batch_size=16 training.num_samples_per_prompt=8 model.hidden_dim=256
+```
+
+See `config/README.md` for detailed configuration documentation.
 
 ## Key Concepts
 

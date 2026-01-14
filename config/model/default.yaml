@@ -1,0 +1,7 @@
+# @package model
+
+# Model architecture hyperparameters
+signal_dim: 64
+prompt_dim: 32
+hidden_dim: 128
+vocab_size: 20
