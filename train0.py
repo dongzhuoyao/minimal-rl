@@ -26,6 +26,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dataset import MNISTDataset
 from model import SimpleUNet
+import numpy as np
+from PIL import Image
 
 
 @hydra.main(version_base=None, config_path=".", config_name="config0")
@@ -104,6 +106,78 @@ def main(cfg: DictConfig):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
     
     total_params = count_parameters(model)
+    
+    # Sampling function for flow matching
+    def sample_images(model, num_samples=8, num_steps=50, sigma_max=80.0, device=None):
+        """
+        Sample images from the flow matching model using Euler integration.
+        
+        Args:
+            model: The flow matching model
+            num_samples: Number of images to sample
+            num_steps: Number of integration steps
+            sigma_max: Maximum sigma value
+            device: Device to run on
+        """
+        if device is None:
+            device = next(model.parameters()).device
+        model.eval()
+        with torch.no_grad():
+            # Sample random labels (digits 0-9)
+            labels = torch.randint(0, cfg.model.vocab_size, (num_samples,), device=device)
+            
+            # Start from noise: x_1 ~ N(0, I)
+            x = torch.randn(num_samples, 1, 28, 28, device=device)
+            
+            # Time steps from 1 to 0 (backwards)
+            timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+            dt = 1.0 / num_steps
+            
+            # Euler integration: x_{t-dt} = x_t - dt * v_pred
+            for i in range(num_steps):
+                t = timesteps[i]
+                sigma = t * sigma_max
+                
+                # Predict velocity
+                v_pred = model(x, sigma, labels)
+                
+                # Euler step: x_{t-dt} = x_t - dt * v_pred
+                x = x - dt * v_pred
+            
+            # Clamp to valid range [0, 1] for MNIST
+            x = torch.clamp(x, 0.0, 1.0)
+            
+        return x, labels
+    
+    def images_to_wandb(images, labels, num_images=8):
+        """
+        Convert tensor images to wandb Image format.
+        
+        Args:
+            images: Tensor of shape [B, 1, 28, 28] with values in [0, 1]
+            labels: Tensor of shape [B] with class labels
+            num_images: Number of images to visualize
+        """
+        # Take first num_images
+        images = images[:num_images].cpu()
+        labels = labels[:num_images].cpu()
+        
+        # Convert to numpy and remove channel dimension for grayscale
+        images_np = images.squeeze(1).numpy()  # [B, 28, 28]
+        
+        # Create wandb images
+        wandb_images = []
+        for i in range(len(images_np)):
+            img = images_np[i]
+            # Convert to uint8
+            img = (img * 255).astype(np.uint8)
+            # Create PIL Image
+            pil_img = Image.fromarray(img, mode='L')
+            # Create wandb image with label
+            wandb_img = wandb.Image(pil_img, caption=f"Label: {labels[i].item()}")
+            wandb_images.append(wandb_img)
+        
+        return wandb_images
     
     print(f"Total parameters: {total_params:,}")
     
@@ -281,6 +355,18 @@ def main(cfg: DictConfig):
             print(f"Train Loss: {avg_train_loss:.6f}")
             print(f"Test Loss: {avg_test_loss:.6f} ± {test_loss_std:.6f}")
             
+            # Sample images for visualization
+            if cfg.wandb.enabled:
+                num_samples = cfg.wandb.get("num_sample_images", 8)
+                sampled_images, sampled_labels = sample_images(
+                    model, 
+                    num_samples=num_samples,
+                    num_steps=cfg.wandb.get("num_sampling_steps", 50),
+                    sigma_max=cfg.model.get("sigma_max", 80.0),
+                    device=device
+                )
+                wandb_images = images_to_wandb(sampled_images, sampled_labels, num_samples)
+            
             # Log to wandb
             if cfg.wandb.enabled:
                 eval_log_dict = {
@@ -289,6 +375,7 @@ def main(cfg: DictConfig):
                     "eval/test_loss_std": test_loss_std,
                     "eval/best_test_loss": best_test_loss,
                     "eval/learning_rate": optimizer.param_groups[0]['lr'],
+                    "eval/sampled_images": wandb_images,
                     "step": step,
                 }
                 wandb.log(eval_log_dict, step=step)

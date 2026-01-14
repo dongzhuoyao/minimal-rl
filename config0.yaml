@@ -38,3 +38,5 @@ wandb:
   tags: []  # Optional tags for the run
   log_freq: 500  # Log metrics every N steps (1 = every step)
   log_grad_norm: true  # Whether to log gradient norms (can be expensive)
+  num_sample_images: 64  # Number of images to sample for visualization
+  num_sampling_steps: 50  # Number of integration steps for sampling

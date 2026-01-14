@@ -1,530 +1,597 @@
 """
-Main training script for FlowGRPO tutorial.
+FloWGRPO (Flow-based Group Relative Policy Optimization) Training Script.
+
+This script implements GRPO training for flow matching models, following the original
+implementation pattern. It loads a pretrained checkpoint from train0.py and fine-tunes
+using reward-based optimization.
 
 Usage:
     python train.py                          # Use default config
-    python train.py training=fast            # Use fast training config
-    python train.py training=gpu            # Use GPU config
-    python train.py model=large              # Use large model
-    python train.py training.num_epochs=100 # Override specific parameter
-    python train.py training.batch_size=8 training.lr=0.0005  # Override multiple
+    python train.py training.max_steps=5000  # Override specific parameter
 """
 import hydra
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import sys
 from tqdm import tqdm
 import os
-import sys
-from collections import defaultdict
+import wandb
 import numpy as np
+from PIL import Image
+from collections import defaultdict
+import copy
 
 # Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
 from dataset import MNISTDataset
-from models.toy_flow_model import create_toy_model
-from rewards.simple_reward import SimpleReward
-from visualization.plotter import TrainingPlotter
+from model import create_mnist_model
+from rewards.mnist_rewards import CombinedMNISTReward, get_recommended_reward_config
 
 
-# ============================================================================
-# GRPO Functions
-# ============================================================================
-
-def compute_group_advantages(rewards, prompt_ids, clip_range=1e-4):
+class PerPromptStatTracker:
     """
-    Compute group-relative advantages for GRPO.
-    
-    In GRPO, advantages are computed relative to the mean reward within
-    each prompt group, rather than a global baseline. This reduces
-    variance and improves training stability.
-    
-    Args:
-        rewards: Tensor of rewards [batch_size]
-        prompt_ids: Tensor of prompt IDs [batch_size]
-        clip_range: Clipping range for advantages
-    
-    Returns:
-        advantages: Tensor of advantages [batch_size]
-        group_stats: Dict with group statistics
+    Tracks statistics per prompt/label for computing advantages in GRPO.
+    Based on original_impl/flow_grpo/stat_tracking.py
     """
-    # Group rewards by prompt_id
-    groups = defaultdict(list)
-    for i, pid in enumerate(prompt_ids.cpu().numpy()):
-        groups[pid].append(i)
-    
-    # Compute group means
-    group_means = {}
-    for pid, indices in groups.items():
-        group_rewards = rewards[indices]
-        group_means[pid] = group_rewards.mean().item()
-    
-    # Compute advantages relative to group mean
-    advantages = torch.zeros_like(rewards)
-    for pid, indices in groups.items():
-        group_rewards = rewards[indices]
-        group_mean = group_means[pid]
-        advantages[indices] = group_rewards - group_mean
-    
-    # Clip advantages
-    advantages = torch.clamp(advantages, -5.0, 5.0)
-    
-    # Compute statistics
-    group_stats = {
-        "num_groups": len(groups),
-        "group_means": group_means,
-        "advantage_mean": advantages.mean().item(),
-        "advantage_std": advantages.std().item(),
-    }
-    
-    return advantages, group_stats
+    def __init__(self, global_std=False):
+        self.global_std = global_std
+        self.stats = {}
+        self.history_prompts = set()
 
-
-def compute_grpo_loss(
-    log_probs_new,
-    log_probs_old,
-    advantages,
-    clip_range=1e-4,
-    beta=0.0,
-    log_probs_ref=None,
-):
-    """
-    Compute GRPO policy loss.
-    
-    Args:
-        log_probs_new: New policy log probabilities [batch_size, num_steps]
-        log_probs_old: Old policy log probabilities [batch_size, num_steps]
-        advantages: Advantages [batch_size, num_steps]
-        clip_range: Clipping range for importance ratio
-        beta: KL penalty coefficient (0 = no KL penalty)
-        log_probs_ref: Reference policy log probs for KL penalty [batch_size, num_steps]
-    
-    Returns:
-        loss: Policy loss scalar
-        info: Dict with loss statistics
-    """
-    # Compute importance ratio
-    ratio = torch.exp(log_probs_new - log_probs_old)
-    
-    # Clipped policy loss
-    unclipped_loss = -advantages * ratio
-    clipped_loss = -advantages * torch.clamp(
-        ratio,
-        1.0 - clip_range,
-        1.0 + clip_range,
-    )
-    policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-    
-    # KL penalty (if beta > 0)
-    kl_loss = torch.tensor(0.0, device=policy_loss.device)
-    if beta > 0 and log_probs_ref is not None:
-        kl = log_probs_new - log_probs_ref
-        kl_loss = beta * torch.mean(kl)
-    
-    total_loss = policy_loss + kl_loss
-    
-    # Statistics
-    info = {
-        "policy_loss": policy_loss.item(),
-        "kl_loss": kl_loss.item(),
-        "total_loss": total_loss.item(),
-        "ratio_mean": ratio.mean().item(),
-        "ratio_std": ratio.std().item(),
-        "advantage_mean": advantages.mean().item(),
-        "advantage_std": advantages.std().item(),
-    }
-    
-    return total_loss, info
-
-
-# ============================================================================
-# FlowGRPOTrainer Class
-# ============================================================================
-
-class FlowGRPOTrainer:
-    """Trainer for FlowGRPO."""
-    
-    def __init__(
-        self,
-        model,
-        prompt_encoder,
-        reward_fn,
-        train_dataset,
-        test_dataset,
-        config,
-    ):
+    def update(self, prompts, rewards, type='grpo'):
         """
-        Args:
-            model: Flow matching model
-            prompt_encoder: Prompt encoder
-            reward_fn: Reward function
-            train_dataset: Training dataset
-            test_dataset: Test dataset
-            config: Training configuration dict
-        """
-        self.model = model
-        self.prompt_encoder = prompt_encoder
-        self.reward_fn = reward_fn
-        self.train_dataset = train_dataset
-        self.test_dataset = test_dataset
-        self.config = config
-        
-        # Setup optimizer
-        self.optimizer = torch.optim.Adam(
-            list(model.parameters()) + list(prompt_encoder.parameters()),
-            lr=config.get("lr", 1e-3),
-        )
-        
-        # Setup device
-        self.device = torch.device(config.get("device", "cpu"))
-        self.model.to(self.device)
-        self.prompt_encoder.to(self.device)
-        
-        # Setup visualization
-        self.plotter = TrainingPlotter(config.get("output_dir", "outputs"))
-        
-        # Training state
-        self.epoch = 0
-        self.step = 0
-    
-    def encode_prompts(self, labels):
-        """Encode digit labels to embeddings."""
-        # Convert labels to tensor if needed
-        if isinstance(labels, (list, tuple)):
-            if isinstance(labels[0], str):
-                # Convert string labels to integers
-                labels = torch.tensor([int(l) for l in labels], device=self.device, dtype=torch.long)
-            else:
-                labels = torch.tensor(labels, device=self.device, dtype=torch.long)
-        elif isinstance(labels, torch.Tensor):
-            labels = labels.to(self.device).long()
-        else:
-            labels = torch.tensor([int(labels)], device=self.device, dtype=torch.long)
-        
-        # Ensure labels are in valid range [0, 9]
-        labels = labels.clamp(0, 9)
-        
-        return self.prompt_encoder(labels)
-    
-    def sample_trajectories(self, labels, num_samples_per_prompt=4):
-        """
-        Sample trajectories from the current policy.
+        Compute advantages from rewards using per-prompt statistics.
         
         Args:
-            labels: Tensor or list of digit labels (0-9)
-            num_samples_per_prompt: Number of samples per prompt
+            prompts: List of prompt strings (or labels) [batch_size]
+            rewards: Array of rewards [batch_size]
+            type: Type of advantage computation ('grpo', 'rwr', 'sft', 'dpo')
         
         Returns:
-            samples: Dict containing trajectories, log_probs, etc.
+            advantages: Array of advantages [batch_size]
         """
-        # Convert labels to tensor if needed
-        # Labels from DataLoader batch are already tensors
-        if isinstance(labels, torch.Tensor):
-            # Convert tensor to list of integers
-            labels = labels.cpu().tolist()
+        prompts = np.array(prompts)
+        rewards = np.array(rewards, dtype=np.float64)
+        unique = np.unique(prompts)
+        advantages = np.empty_like(rewards) * 0.0
         
-        if isinstance(labels, (list, tuple)):
-            # Ensure all elements are integers
-            labels = [int(l) for l in labels]
-        else:
-            labels = [int(labels)]
+        for prompt in unique:
+            prompt_rewards = rewards[prompts == prompt]
+            if prompt not in self.stats:
+                self.stats[prompt] = []
+            self.stats[prompt].extend(prompt_rewards)
+            self.history_prompts.add(hash(str(prompt)))
         
-        # Expand labels
-        expanded_labels = []
-        prompt_ids = []
-        for i, label in enumerate(labels):
-            for _ in range(num_samples_per_prompt):
-                expanded_labels.append(label)
-                prompt_ids.append(i)
-        
-        expanded_labels = torch.tensor(expanded_labels, device=self.device, dtype=torch.long)
-        
-        # Encode labels
-        prompt_embeds = self.encode_prompts(expanded_labels)
-        
-        # Sample trajectories
-        self.model.eval()
-        with torch.no_grad():
-            trajectory, log_probs = self.model.sample(
-                prompt_embeds,
-                num_steps=self.config.get("num_steps", 20),
-                device=self.device,
-            )
-        
-        # Get final signals
-        final_signals = trajectory[-1]
-        
-        # Compute rewards
-        rewards = self.reward_fn(final_signals, expanded_labels)
-        
-        return {
-            "trajectory": trajectory,
-            "log_probs": log_probs,
-            "rewards": rewards,
-            "labels": expanded_labels,
-            "prompt_ids": torch.tensor(prompt_ids, device=self.device),
-            "final_signals": final_signals,
-        }
-    
-    def train_epoch(self):
-        """Train for one epoch."""
-        self.model.train()
-        self.prompt_encoder.train()
-        
-        # Create dataloader
-        dataloader = DataLoader(
-            self.train_dataset,
-            batch_size=self.config.get("batch_size", 4),
-            shuffle=True,
-        )
-        
-        epoch_losses = []
-        epoch_rewards = []
-        
-        for batch in tqdm(dataloader, desc=f"Epoch {self.epoch}"):
-            labels = batch["label"]
-            
-            # Sample trajectories
-            samples = self.sample_trajectories(
-                labels,
-                num_samples_per_prompt=self.config.get("num_samples_per_prompt", 4),
-            )
-            
-            # Compute advantages
-            advantages, group_stats = compute_group_advantages(
-                samples["rewards"],
-                samples["prompt_ids"],
-                clip_range=self.config.get("clip_range", 1e-4),
-            )
-            
-            # Expand advantages to match log_probs shape
-            # log_probs: [batch_size, num_steps]
-            # advantages: [batch_size] -> expand to [batch_size, num_steps]
-            num_steps = samples["log_probs"].shape[1]
-            advantages_expanded = advantages.unsqueeze(1).expand(-1, num_steps)
-            
-            # Compute loss for each timestep
-            total_loss = 0
-            loss_info = {}
-            
-            for step_idx in range(num_steps):
-                # Get log probs for this step
-                log_probs_old = samples["log_probs"][:, step_idx].detach()
-                advantages_step = advantages_expanded[:, step_idx]
-                
-                # Recompute log probs with current policy
-                prompt_embeds = self.encode_prompts(samples["labels"])
-                
-                # Get state at this step
-                x = samples["trajectory"][step_idx]
-                t = torch.ones(len(samples["labels"]), 1, device=self.device) * (
-                    step_idx / num_steps
-                )
-                
-                # Compute velocity and log prob
-                v = self.model(x, t, prompt_embeds)
-                log_prob_new = -0.5 * torch.sum((v - x) ** 2, dim=-1)
-                
-                # Compute loss
-                loss, info = compute_grpo_loss(
-                    log_prob_new.unsqueeze(1),
-                    log_probs_old.unsqueeze(1),
-                    advantages_step.unsqueeze(1),
-                    clip_range=self.config.get("clip_range", 1e-4),
-                    beta=self.config.get("beta", 0.0),
-                )
-                
-                total_loss += loss
-                
-                # Accumulate info
-                for k, v in info.items():
-                    if k not in loss_info:
-                        loss_info[k] = []
-                    loss_info[k].append(v)
-            
-            # Average loss over steps
-            total_loss = total_loss / num_steps
-            
-            # Backward pass
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(self.model.parameters()) + list(self.prompt_encoder.parameters()),
-                self.config.get("max_grad_norm", 1.0),
-            )
-            self.optimizer.step()
-            
-            # Logging
-            epoch_losses.append(total_loss.item())
-            epoch_rewards.append(samples["rewards"].mean().item())
-            
-            self.step += 1
-        
-        # Average statistics
-        avg_loss = sum(epoch_losses) / len(epoch_losses)
-        avg_reward = sum(epoch_rewards) / len(epoch_rewards)
-        
-        return {
-            "loss": avg_loss,
-            "reward": avg_reward,
-            "loss_info": {k: sum(v) / len(v) for k, v in loss_info.items()},
-        }
-    
-    def evaluate(self):
-        """Evaluate on test set."""
-        self.model.eval()
-        self.prompt_encoder.eval()
-        
-        test_loader = DataLoader(
-            self.test_dataset,
-            batch_size=self.config.get("test_batch_size", 8),
-            shuffle=False,
-        )
-        
-        all_rewards = []
-        all_signals = []
-        all_prompts = []
-        
-        with torch.no_grad():
-            for batch in test_loader:
-                labels = batch["label"]
-                
-                # Sample single trajectory per label
-                prompt_embeds = self.encode_prompts(labels)
-                trajectory, _ = self.model.sample(
-                    prompt_embeds,
-                    num_steps=self.config.get("eval_num_steps", 20),
-                    device=self.device,
-                )
-                
-                final_signals = trajectory[-1]
-                rewards = self.reward_fn(final_signals, labels)
-                
-                all_rewards.extend(rewards.cpu().numpy())
-                all_signals.append(final_signals.cpu())
-                all_prompts.extend(labels.cpu().tolist())
-        
-        return {
-            "rewards": all_rewards,
-            "signals": torch.cat(all_signals, dim=0),
-            "prompts": all_prompts,
-            "mean_reward": sum(all_rewards) / len(all_rewards),
-        }
-    
-    def train(self, num_epochs):
-        """Main training loop."""
-        for epoch in range(num_epochs):
-            self.epoch = epoch
-            
-            # Train
-            train_stats = self.train_epoch()
-            
-            # Evaluate
-            if (epoch + 1) % self.config.get("eval_freq", 5) == 0:
-                eval_stats = self.evaluate()
-                print(f"\nEpoch {epoch+1}/{num_epochs}")
-                print(f"Train Loss: {train_stats['loss']:.4f}")
-                print(f"Train Reward: {train_stats['reward']:.4f}")
-                print(f"Test Reward: {eval_stats['mean_reward']:.4f}")
-                
-                # Visualize
-                # Reshape signals from [batch, 784] to [batch, 28, 28] for visualization
-                signals_reshaped = eval_stats["signals"][:8].view(-1, 28, 28)
-                self.plotter.update(
-                    epoch,
-                    train_stats,
-                    eval_stats,
-                    signals_reshaped,  # Show first 8 samples as 28x28 images
-                    eval_stats["prompts"][:8],
-                )
+        for prompt in unique:
+            self.stats[prompt] = np.stack(self.stats[prompt])
+            prompt_rewards = rewards[prompts == prompt]
+            mean = np.mean(self.stats[prompt], axis=0, keepdims=True)
+            if self.global_std:
+                std = np.std(rewards, axis=0, keepdims=True) + 1e-4
             else:
-                print(f"\nEpoch {epoch+1}/{num_epochs}")
-                print(f"Train Loss: {train_stats['loss']:.4f}")
-                print(f"Train Reward: {train_stats['reward']:.4f}")
+                std = np.std(self.stats[prompt], axis=0, keepdims=True) + 1e-4
+            
+            if type == 'grpo':
+                advantages[prompts == prompt] = (prompt_rewards - mean) / std
+            elif type == 'rwr':
+                advantages[prompts == prompt] = prompt_rewards
+            elif type == 'sft':
+                advantages[prompts == prompt] = (torch.tensor(prompt_rewards) == torch.max(torch.tensor(prompt_rewards))).float().numpy()
+            elif type == 'dpo':
+                prompt_advantages = torch.tensor(prompt_rewards)
+                max_idx = torch.argmax(prompt_advantages)
+                min_idx = torch.argmin(prompt_advantages)
+                if max_idx == min_idx:
+                    min_idx = 0
+                    max_idx = 1
+                result = torch.zeros_like(prompt_advantages).float()
+                result[max_idx] = 1.0
+                result[min_idx] = -1.0
+                advantages[prompts == prompt] = result.numpy()
+        
+        return advantages
+
+    def get_stats(self):
+        avg_group_size = sum(len(v) for v in self.stats.values()) / len(self.stats) if self.stats else 0
+        history_prompts = len(self.history_prompts)
+        return avg_group_size, history_prompts
+    
+    def clear(self):
+        self.stats = {}
 
 
-# ============================================================================
-# Main Training Function
-# ============================================================================
+def sample_with_logprob(model, labels, num_steps, device, return_trajectory=False, enable_grad=False):
+    """
+    Sample trajectories with log probabilities for GRPO training.
+    
+    Args:
+        model: Flow matching model
+        labels: [B] class labels (0-9)
+        num_steps: Number of integration steps
+        device: Device to run on
+        return_trajectory: If True, return full trajectory
+        enable_grad: If True, enable gradients (for training phase)
+    
+    Returns:
+        final_images: [B, signal_dim] final generated images
+        trajectory: List of [B, signal_dim] tensors (if return_trajectory=True)
+        log_probs: [B, num_steps] log probabilities for each step
+        timesteps: [B, num_steps] time values for each step
+    """
+    if not enable_grad:
+        model.eval()
+    B = labels.shape[0]
+    signal_dim = model.signal_dim
+    
+    # Initialize with noise
+    x = torch.randn(B, signal_dim, device=device)
+    
+    trajectory = [x.clone()] if return_trajectory else None
+    log_probs = []
+    timesteps = []
+    
+    # Euler integration
+    dt = 1.0 / num_steps
+    t = torch.zeros(B, 1, device=device)
+    
+    context = torch.enable_grad() if enable_grad else torch.no_grad()
+    with context:
+        for step in range(num_steps):
+            # Compute velocity
+            v = model(x, t, labels)
+            
+            # Compute log probability for this step
+            # For flow matching: log p ≈ -0.5 * ||v||^2 * dt
+            log_prob = -0.5 * torch.sum(v ** 2, dim=-1) * dt
+            log_probs.append(log_prob)
+            timesteps.append(t.clone())
+            
+            # Update x
+            x_new = x + dt * v
+            
+            # Update x
+            x = x_new
+            
+            # Update time
+            t = t + dt
+            
+            # Store trajectory if needed
+            if return_trajectory:
+                trajectory.append(x.clone())
+    
+    log_probs = torch.stack(log_probs, dim=1)  # [B, num_steps]
+    timesteps = torch.cat(timesteps, dim=1)  # [B, num_steps]
+    
+    # Reshape final images to [B, 1, 28, 28] for reward computation
+    final_images = x.view(B, 1, 28, 28)
+    
+    if return_trajectory:
+        return final_images, trajectory, log_probs, timesteps
+    else:
+        return final_images, log_probs, timesteps
 
 
-@hydra.main(version_base=None, config_path="config", config_name="config")
+def compute_log_prob_at_timestep(model, x_t, t, labels, x_next, dt):
+    """
+    Compute log probability of transitioning from x_t to x_next at timestep t.
+    
+    Args:
+        model: Flow matching model
+        x_t: [B, signal_dim] current state
+        t: [B, 1] current time
+        labels: [B] class labels
+        x_next: [B, signal_dim] next state (from trajectory)
+        dt: Time step size
+    
+    Returns:
+        log_prob: [B] log probabilities
+    """
+    # Predict velocity
+    v_pred = model(x_t, t, labels)
+    
+    # Compute log probability: -0.5 * ||v_pred||^2 * dt
+    log_prob = -0.5 * torch.sum(v_pred ** 2, dim=-1) * dt
+    
+    return log_prob
+
+
+@hydra.main(version_base=None, config_path=".", config_name="config")
 def main(cfg: DictConfig):
-    """Main training function with Hydra configuration."""
+    """Main FloWGRPO training function with Hydra configuration."""
     
     # Print configuration
     print("=" * 60)
-    print("Configuration:")
+    print("FloWGRPO Training Configuration:")
     print("=" * 60)
     print(OmegaConf.to_yaml(cfg))
     print("=" * 60)
+    
+    # Initialize wandb
+    if cfg.wandb.enabled:
+        hydra_cfg = HydraConfig.get()
+        hydra_output_dir = Path(hydra_cfg.run.dir)
+        wandb_dir = hydra_output_dir / "wandb"
+        os.environ["WANDB_DIR"] = str(wandb_dir)
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+        
+        wandb.init(
+            project=cfg.wandb.project,
+            name=cfg.wandb.run_name if cfg.wandb.run_name else cfg.run_name,
+            config=OmegaConf.to_container(cfg, resolve=True),
+            tags=cfg.wandb.get("tags", []),
+            dir=str(wandb_dir),
+        )
+        print(f"Wandb initialized: {wandb.run.url}")
     
     # Set random seed
     if hasattr(cfg, 'seed'):
         torch.manual_seed(cfg.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(cfg.seed)
+        np.random.seed(cfg.seed)
     
     # Determine device
     device = cfg.training.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+    device = torch.device(device)
     
-    # Load MNIST datasets
+    # Create output directory
+    output_dir = Path(cfg.paths.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Load MNIST dataset
     print("Loading MNIST datasets...")
     dataset_dir = Path(cfg.dataset.dataset_dir)
     train_dataset = MNISTDataset(dataset_dir, split="train", download=True)
-    test_dataset = MNISTDataset(dataset_dir, split="test", download=True)
-    
     print(f"Train samples: {len(train_dataset)}")
-    print(f"Test samples: {len(test_dataset)}")
     
     # Create model
-    print("Creating model...")
-    model, prompt_encoder = create_toy_model(
+    print("Creating flow matching model...")
+    model = create_mnist_model(
         signal_dim=cfg.model.signal_dim,
-        prompt_dim=cfg.model.prompt_dim,
-        hidden_dim=cfg.model.hidden_dim,
+        time_emb_dim=cfg.model.get("time_emb_dim", 40),
         vocab_size=cfg.model.vocab_size,
     )
+    model.to(device)
     
-    # Create reward function
-    reward_fn = SimpleReward()
+    # Load pretrained checkpoint
+    checkpoint_path = cfg.pretrained_checkpoint
+    if checkpoint_path is None:
+        # Default to checkpoint from train0.py
+        checkpoint_path = "outputs/flow_matching/best_model.pt"
     
-    # Training config dictionary for trainer
-    trainer_config = {
-        "batch_size": cfg.training.batch_size,
-        "num_samples_per_prompt": cfg.training.num_samples_per_prompt,
-        "num_steps": cfg.training.num_steps,
-        "eval_num_steps": cfg.training.eval_num_steps,
-        "lr": cfg.training.lr,
-        "clip_range": cfg.training.clip_range,
-        "beta": cfg.training.beta,
-        "device": device,
-        "output_dir": cfg.paths.output_dir,
-        "eval_freq": cfg.training.eval_freq,
-        "max_grad_norm": cfg.training.max_grad_norm,
-    }
+    if os.path.exists(checkpoint_path):
+        print(f"Loading pretrained checkpoint from {checkpoint_path}...")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        # Handle different checkpoint formats
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        print("Checkpoint loaded successfully!")
+    else:
+        print(f"Warning: Checkpoint not found at {checkpoint_path}. Starting from scratch.")
     
-    # Create trainer
-    trainer = FlowGRPOTrainer(
-        model=model,
-        prompt_encoder=prompt_encoder,
-        reward_fn=reward_fn,
-        train_dataset=train_dataset,
-        test_dataset=test_dataset,
-        config=trainer_config,
+    # Setup optimizer
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=cfg.training.lr,
     )
     
-    # Train
-    print("Starting training...")
-    trainer.train(num_epochs=cfg.training.num_epochs)
+    # Initialize reward function
+    print("Initializing reward function...")
+    reward_config = cfg.get("reward", {}).get("config", "balanced")
+    reward_fn = get_recommended_reward_config(reward_config, device=device)
     
-    print(f"\nTraining complete! Check outputs in {cfg.paths.output_dir}")
+    # Initialize stat tracker for advantages
+    stat_tracker = PerPromptStatTracker(global_std=cfg.training.get("global_std", False))
+    
+    # Create data loader
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.training.batch_size,
+        shuffle=True,
+        num_workers=cfg.training.get("num_workers", 4),
+    )
+    
+    # Training loop
+    print("Starting FloWGRPO training...")
+    train_iter = iter(train_loader)
+    step = 0
+    epoch = 0
+    
+    pbar = tqdm(total=cfg.training.max_steps, desc="Training")
+    
+    while step < cfg.training.max_steps:
+        # ========== SAMPLING PHASE ==========
+        model.eval()
+        samples = []
+        
+        # Sample multiple times per batch
+        num_samples_per_prompt = cfg.training.num_samples_per_prompt
+        batch_size = cfg.training.batch_size
+        
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+            epoch += 1
+        
+        labels = batch["label"].to(device)  # [batch_size]
+        prompts = batch["prompt"]  # List of strings
+        
+        # Expand labels and prompts for multiple samples per prompt
+        expanded_labels = labels.repeat_interleave(num_samples_per_prompt)  # [batch_size * num_samples_per_prompt]
+        expanded_prompts = [p for p in prompts for _ in range(num_samples_per_prompt)]
+        
+        # Sample trajectories
+        with torch.no_grad():
+            final_images, log_probs_old, timesteps = sample_with_logprob(
+                model,
+                expanded_labels,
+                num_steps=cfg.training.num_steps,
+                device=device,
+                return_trajectory=False,
+            )
+        
+        # Compute rewards
+        # Convert images to format expected by reward function: [B, 1, 28, 28] -> [B, 1, 28, 28]
+        # Reward function expects images in [0, 1] range
+        images_for_reward = torch.clamp(final_images, 0.0, 1.0)
+        
+        # Create prompt strings for reward function
+        reward_prompts = [f"digit {label.item()}" for label in expanded_labels]
+        
+        rewards = reward_fn(images_for_reward, reward_prompts)  # [batch_size * num_samples_per_prompt]
+        rewards = rewards.cpu().numpy()
+        
+        # Compute advantages using stat tracker
+        advantages = stat_tracker.update(expanded_prompts, rewards, type='grpo')
+        advantages = torch.tensor(advantages, device=device, dtype=torch.float32)
+        
+        # Reshape for training: [batch_size * num_samples_per_prompt, num_steps] -> [batch_size, num_samples_per_prompt, num_steps]
+        log_probs_old = log_probs_old.view(batch_size, num_samples_per_prompt, cfg.training.num_steps)
+        advantages = advantages.view(batch_size, num_samples_per_prompt)
+        rewards = rewards.reshape(batch_size, num_samples_per_prompt)
+        
+        # Store samples for training (need to store trajectories for proper training)
+        # Re-sample with trajectories stored (no grad for sampling phase)
+        with torch.no_grad():
+            _, trajectories_full, log_probs_old_full, timesteps_full = sample_with_logprob(
+                model,
+                expanded_labels,
+                num_steps=cfg.training.num_steps,
+                device=device,
+                return_trajectory=True,
+                enable_grad=False,
+            )
+        
+        # Store samples with trajectories
+        for i in range(batch_size):
+            for j in range(num_samples_per_prompt):
+                sample_idx = i * num_samples_per_prompt + j
+                samples.append({
+                    "label": expanded_labels[sample_idx],
+                    "prompt": expanded_prompts[sample_idx],
+                    "log_probs_old": log_probs_old_full[sample_idx],  # [num_steps]
+                    "trajectory": [traj[sample_idx] for traj in trajectories_full],  # List of [signal_dim]
+                    "timesteps": timesteps_full[sample_idx],  # [num_steps]
+                    "advantages": advantages[i, j],  # scalar
+                    "reward": rewards[i, j],  # scalar
+                    "image": final_images[sample_idx],  # [1, 28, 28]
+                })
+        
+        # ========== TRAINING PHASE ==========
+        model.train()
+        
+        # Shuffle samples
+        np.random.shuffle(samples)
+        
+        # Train on samples
+        num_inner_epochs = cfg.training.get("num_inner_epochs", 1)
+        for inner_epoch in range(num_inner_epochs):
+            # Re-shuffle for each inner epoch
+            if inner_epoch > 0:
+                np.random.shuffle(samples)
+            
+            # Process samples in mini-batches
+            train_batch_size = cfg.training.get("train_batch_size", batch_size)
+            for batch_start in range(0, len(samples), train_batch_size):
+                batch_samples = samples[batch_start:batch_start + train_batch_size]
+                
+                if len(batch_samples) == 0:
+                    continue
+                
+                # Extract batch data
+                batch_labels = torch.stack([s["label"] for s in batch_samples])
+                batch_log_probs_old = torch.stack([s["log_probs_old"] for s in batch_samples])  # [B, num_steps]
+                batch_advantages = torch.stack([s["advantages"] for s in batch_samples])  # [B]
+                
+                # For each timestep, compute new log prob and GRPO loss
+                num_train_timesteps = cfg.training.num_steps
+                dt = 1.0 / num_train_timesteps
+                
+                total_loss = 0.0
+                info = defaultdict(list)
+                
+                # Extract trajectories from samples
+                trajectories_list = []
+                timesteps_list = []
+                for s in batch_samples:
+                    trajectories_list.append(s["trajectory"])
+                    timesteps_list.append(s["timesteps"])
+                
+                # Convert to tensors: [B, num_steps+1, signal_dim]
+                max_len = max(len(traj) for traj in trajectories_list)
+                signal_dim = trajectories_list[0][0].shape[0]
+                trajectories_tensor = torch.zeros(len(batch_samples), max_len, signal_dim, device=device)
+                for i, traj in enumerate(trajectories_list):
+                    for j, state in enumerate(traj):
+                        trajectories_tensor[i, j] = state
+                
+                timesteps_tensor = torch.stack(timesteps_list, dim=0)  # [B, num_steps]
+                
+                # Train on each timestep
+                for j in range(num_train_timesteps):
+                    # Get states at timestep j
+                    x_t = trajectories_tensor[:, j]  # [B, signal_dim]
+                    x_next = trajectories_tensor[:, j + 1]  # [B, signal_dim]
+                    t = timesteps_tensor[:, j:j+1]  # [B, 1]
+                    
+                    # Compute new log probability
+                    log_prob_new = compute_log_prob_at_timestep(
+                        model, x_t, t, batch_labels, x_next, dt
+                    )  # [B]
+                    
+                    # Get old log probability for this timestep
+                    log_prob_old = batch_log_probs_old[:, j]  # [B]
+                    
+                    # Expand advantages to match timesteps (same advantage for all timesteps)
+                    advantages_expanded = batch_advantages  # [B]
+                    
+                    # Clip advantages
+                    adv_clip_max = cfg.training.get("adv_clip_max", 10.0)
+                    advantages_clipped = torch.clamp(
+                        advantages_expanded,
+                        -adv_clip_max,
+                        adv_clip_max,
+                    )
+                    
+                    # Compute ratio
+                    ratio = torch.exp(log_prob_new - log_prob_old)  # [B]
+                    
+                    # GRPO loss: clipped PPO-style loss
+                    clip_range = cfg.training.clip_range
+                    unclipped_loss = -advantages_clipped * ratio
+                    clipped_loss = -advantages_clipped * torch.clamp(
+                        ratio,
+                        1.0 - clip_range,
+                        1.0 + clip_range,
+                    )
+                    policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+                    
+                    # Optional KL penalty (if beta > 0)
+                    beta = cfg.training.get("beta", 0.0)
+                    if beta > 0:
+                        # Approximate KL divergence: 0.5 * (log_prob_new - log_prob_old)^2
+                        kl_loss = 0.5 * torch.mean((log_prob_new - log_prob_old) ** 2)
+                        loss = policy_loss + beta * kl_loss
+                    else:
+                        loss = policy_loss
+                    
+                    total_loss += loss
+                    
+                    # Track metrics
+                    info["approx_kl"].append(0.5 * torch.mean((log_prob_new - log_prob_old) ** 2).item())
+                    info["clipfrac"].append(torch.mean((torch.abs(ratio - 1.0) > clip_range).float()).item())
+                    info["policy_loss"].append(policy_loss.item())
+                    if beta > 0:
+                        info["kl_loss"].append(kl_loss.item())
+                
+                # Average loss across timesteps
+                total_loss = total_loss / num_train_timesteps
+                
+                # Backward pass
+                optimizer.zero_grad()
+                total_loss.backward()
+                
+                # Gradient clipping
+                if cfg.training.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        cfg.training.max_grad_norm,
+                    )
+                
+                optimizer.step()
+                
+                step += 1
+                pbar.update(1)
+                
+                # Logging
+                if cfg.wandb.enabled and step % cfg.wandb.log_freq == 0:
+                    log_dict = {
+                        "train/loss": total_loss.item(),
+                        "train/policy_loss": np.mean(info["policy_loss"]),
+                        "train/approx_kl": np.mean(info["approx_kl"]),
+                        "train/clipfrac": np.mean(info["clipfrac"]),
+                        "train/learning_rate": optimizer.param_groups[0]['lr'],
+                        "train/mean_reward": np.mean([s["reward"] for s in batch_samples]),
+                        "train/mean_advantage": advantages_clipped.mean().item(),
+                        "step": step,
+                    }
+                    if beta > 0:
+                        log_dict["train/kl_loss"] = np.mean(info["kl_loss"])
+                    
+                    wandb.log(log_dict, step=step)
+                
+                # Evaluation and checkpointing
+                if step % cfg.training.eval_freq == 0:
+                    # Sample some images for visualization
+                    if cfg.wandb.enabled:
+                        model.eval()
+                        with torch.no_grad():
+                            test_labels = torch.randint(0, cfg.model.vocab_size, (8,), device=device)
+                            test_images, _, _ = sample_with_logprob(
+                                model,
+                                test_labels,
+                                num_steps=cfg.training.eval_num_steps,
+                                device=device,
+                            )
+                            test_images = torch.clamp(test_images, 0.0, 1.0)
+                            
+                            # Convert to wandb images
+                            wandb_images = []
+                            for i in range(len(test_images)):
+                                img = test_images[i, 0].cpu().numpy()
+                                img = (img * 255).astype(np.uint8)
+                                pil_img = Image.fromarray(img, mode='L')
+                                wandb_img = wandb.Image(pil_img, caption=f"Label: {test_labels[i].item()}")
+                                wandb_images.append(wandb_img)
+                            
+                            wandb.log({"eval/sampled_images": wandb_images}, step=step)
+                        model.train()
+                    
+                    # Save checkpoint
+                    checkpoint = {
+                        'step': step,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                    }
+                    torch.save(checkpoint, output_dir / f'checkpoint_step_{step}.pt')
+                    print(f"\nSaved checkpoint at step {step}")
+                
+                if step >= cfg.training.max_steps:
+                    break
+            
+            if step >= cfg.training.max_steps:
+                break
+        
+        if step >= cfg.training.max_steps:
+            break
+    
+    pbar.close()
+    
+    # Save final model
+    final_checkpoint = {
+        'step': step,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }
+    torch.save(final_checkpoint, output_dir / 'final_model.pt')
+    print(f"\nTraining complete! Final model saved to {output_dir / 'final_model.pt'}")
+    
+    # Finish wandb run
+    if cfg.wandb.enabled:
+        wandb.finish()
 
 
 if __name__ == "__main__":

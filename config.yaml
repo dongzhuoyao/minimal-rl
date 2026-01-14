@@ -15,17 +15,26 @@ model:
 
 # Training hyperparameters
 training:
-  num_epochs: 50
+  max_steps: 100000  # Maximum number of training steps
   batch_size: 4
   num_samples_per_prompt: 4
-  num_steps: 20
-  eval_num_steps: 20
+  num_steps: 20  # Number of flow matching steps per sample
+  eval_num_steps: 20  # Number of flow matching steps for evaluation
   lr: 1e-3
   clip_range: 0.0001
   beta: 0.0
-  eval_freq: 5
+  eval_freq: 500  # Frequency of evaluation (in steps)
   max_grad_norm: 1.0
   device: "auto"  # Options: "cpu", "cuda", "auto" (auto-detect)
+  save_freq: 1000  # Frequency of checkpoint saving (in steps)
+
+# Checkpoint configuration
+pretrained_checkpoint: "outputs/flow_matching/best_model.pt"  # Path to pretrained checkpoint from train0.py
+resume_from: null  # Path to checkpoint to resume training from (loads optimizer state too)
+
+# Reward configuration
+reward:
+  config: "balanced"  # Reward config: 'accuracy', 'quality', 'balanced', 'diverse'
 
 # Dataset configuration
 dataset:
@@ -35,3 +44,14 @@ dataset:
 # Output paths
 paths:
   output_dir: "outputs"
+
+# Wandb configuration
+wandb:
+  enabled: false  # Set to true to enable wandb logging
+  project: "minimal-rl"
+  run_name: null  # Uses run_name from top level if null
+  tags: []  # Optional tags for the run
+  log_freq: 500  # Log metrics every N steps (1 = every step)
+  log_grad_norm: true  # Whether to log gradient norms (can be expensive)
+  num_sample_images: 64  # Number of images to sample for visualization
+  num_sampling_steps: 50  # Number of integration steps for sampling

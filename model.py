@@ -179,3 +179,134 @@ class SimpleUNet(nn.Module):
         """Count total number of trainable parameters"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+
+class MNISTFlowModel(nn.Module):
+    """
+    Flow matching model wrapper for MNIST that works directly with labels.
+    No prompt encoder needed - uses labels directly.
+    """
+    
+    def __init__(self, signal_dim=784, time_emb_dim=40, vocab_size=10):
+        """
+        Args:
+            signal_dim: Dimension of flattened signal (784 for MNIST 28x28)
+            time_emb_dim: Dimension of time embeddings
+            vocab_size: Number of classes (10 for MNIST digits 0-9)
+        """
+        super().__init__()
+        self.signal_dim = signal_dim
+        self.vocab_size = vocab_size
+        
+        # Calculate image dimensions (assuming square images)
+        self.img_size = int(np.sqrt(signal_dim))
+        assert self.img_size * self.img_size == signal_dim, \
+            f"signal_dim must be a perfect square, got {signal_dim}"
+        
+        # Use SimpleUNet directly
+        self.unet = SimpleUNet(
+            img_channels=1,
+            label_dim=vocab_size,
+            time_emb_dim=time_emb_dim,
+        )
+    
+    def forward(self, x, t, labels):
+        """
+        Forward pass for flow matching.
+        
+        Args:
+            x: [B, signal_dim] flattened signal
+            t: [B, 1] time values in [0, 1]
+            labels: [B] class labels (0-9)
+        
+        Returns:
+            v: [B, signal_dim] velocity field
+        """
+        # Reshape to image format
+        B = x.shape[0]
+        x_img = x.view(B, 1, self.img_size, self.img_size)
+        
+        # Convert time t to sigma (noise level) using Karras schedule
+        t_flat = t.squeeze(-1) if t.dim() > 1 else t  # [B]
+        sigma_min, sigma_max = 0.002, 80.0
+        rho = 7.0
+        min_inv_rho = sigma_min ** (1 / rho)
+        max_inv_rho = sigma_max ** (1 / rho)
+        sigma = (max_inv_rho + t_flat * (min_inv_rho - max_inv_rho)) ** rho
+        
+        # Use SimpleUNet directly with labels
+        output = self.unet(x_img, sigma, labels)
+        
+        # Flatten output back to signal dimension
+        v = output.view(B, self.signal_dim)
+        
+        return v
+    
+    def sample(self, labels, num_steps=20, device="cpu"):
+        """
+        Sample trajectories using flow matching.
+        
+        Args:
+            labels: [B] class labels (0-9)
+            num_steps: Number of integration steps
+            device: Device to run on
+        
+        Returns:
+            trajectory: List of [B, signal_dim] tensors, one per step
+            log_probs: [B, num_steps] log probabilities
+        """
+        self.eval()
+        B = labels.shape[0]
+        
+        # Initialize with noise
+        x = torch.randn(B, self.signal_dim, device=device)
+        
+        trajectory = [x.clone()]
+        log_probs = []
+        
+        # Euler integration
+        dt = 1.0 / num_steps
+        t = torch.zeros(B, 1, device=device)
+        
+        for step in range(num_steps):
+            # Compute velocity using SimpleUNet
+            with torch.no_grad():
+                v = self.forward(x, t, labels)
+            
+            # Update x
+            x = x + dt * v
+            
+            # Compute log probability
+            log_prob = -0.5 * torch.sum((v - x) ** 2, dim=-1)
+            log_probs.append(log_prob)
+            
+            # Update time
+            t = t + dt
+            
+            # Store trajectory
+            trajectory.append(x.clone())
+        
+        log_probs = torch.stack(log_probs, dim=1)  # [B, num_steps]
+        
+        return trajectory, log_probs
+
+
+def create_mnist_model(signal_dim=784, time_emb_dim=40, vocab_size=10):
+    """
+    Create a MNIST flow matching model that works directly with labels.
+    
+    Args:
+        signal_dim: Dimension of flattened signal (784 for MNIST 28x28)
+        time_emb_dim: Dimension of time embeddings
+        vocab_size: Number of classes (10 for MNIST digits 0-9)
+    
+    Returns:
+        model: MNISTFlowModel instance
+    """
+    model = MNISTFlowModel(
+        signal_dim=signal_dim,
+        time_emb_dim=time_emb_dim,
+        vocab_size=vocab_size,
+    )
+    
+    return model
+
