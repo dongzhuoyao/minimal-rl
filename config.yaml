@@ -1,0 +1,37 @@
+# Single Hydra config file for FlowGRPO tutorial
+
+# Run name for logging and outputs
+run_name: "flowgrpo_tutorial"
+
+# Random seed for reproducibility
+seed: 42
+
+# Model architecture hyperparameters
+model:
+  signal_dim: 784  # MNIST: 28x28 = 784
+  prompt_dim: 32
+  hidden_dim: 256  # Increased for MNIST complexity
+  vocab_size: 10   # Digits 0-9
+
+# Training hyperparameters
+training:
+  num_epochs: 50
+  batch_size: 4
+  num_samples_per_prompt: 4
+  num_steps: 20
+  eval_num_steps: 20
+  lr: 1e-3
+  clip_range: 0.0001
+  beta: 0.0
+  eval_freq: 5
+  max_grad_norm: 1.0
+  device: "auto"  # Options: "cpu", "cuda", "auto" (auto-detect)
+
+# Dataset configuration
+dataset:
+  dataset_dir: "dataset"
+  split: "train"  # For dataset loading
+
+# Output paths
+paths:
+  output_dir: "outputs"

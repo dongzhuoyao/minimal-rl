@@ -1,7 +1,0 @@
-# @package model
-
-# Model architecture hyperparameters
-signal_dim: 784  # MNIST: 28x28 = 784
-prompt_dim: 32
-hidden_dim: 256  # Increased for MNIST complexity
-vocab_size: 10   # Digits 0-9

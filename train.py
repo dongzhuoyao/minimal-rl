@@ -74,7 +74,7 @@ def main(cfg: DictConfig):
         "num_samples_per_prompt": cfg.training.num_samples_per_prompt,
         "num_steps": cfg.training.num_steps,
         "eval_num_steps": cfg.training.eval_num_steps,
-        "learning_rate": cfg.training.learning_rate,
+        "lr": cfg.training.lr,
         "clip_range": cfg.training.clip_range,
         "beta": cfg.training.beta,
         "device": device,
