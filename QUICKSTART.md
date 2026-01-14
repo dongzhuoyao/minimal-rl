@@ -12,7 +12,7 @@ pip install -r requirements.txt
 ### Step 1: Generate the Dataset
 
 ```bash
-python -m tutorial.dataset.generate_dataset
+python -m dataset.generate_dataset
 ```
 
 This creates `tutorial/dataset/train.txt` and `tutorial/dataset/test.txt` with simple prompts.
@@ -22,7 +22,7 @@ This creates `tutorial/dataset/train.txt` and `tutorial/dataset/test.txt` with s
 To see how the model works without training:
 
 ```bash
-python tutorial/example.py
+python example.py
 ```
 
 This will:
@@ -35,17 +35,17 @@ This will:
 ### Step 3: Train the Model
 
 ```bash
-python tutorial/train.py --num_epochs 20
+python train.py --num_epochs 20
 ```
 
 This will:
 - Train the FlowGRPO model
 - Generate visualizations every 5 epochs
-- Save outputs to `tutorial/outputs/`
+- Save outputs to `outputs/`
 
 ### Step 4: View Results
 
-Check the `tutorial/outputs/` directory for:
+Check the `outputs/` directory for:
 - `training_curves.png`: Loss and reward curves
 - `samples_epoch_X.png`: Generated samples at each evaluation epoch
 
@@ -95,7 +95,7 @@ Edit `rewards/simple_reward.py`:
 
 Modify `train.py` or pass arguments:
 ```bash
-python tutorial/train.py \
+python train.py \
     --num_epochs 50 \
     --batch_size 8 \
     --learning_rate 5e-4 \
@@ -109,21 +109,21 @@ python tutorial/train.py \
 If you get import errors, make sure you're running from the repository root:
 ```bash
 cd /path/to/minimal-rl
-python tutorial/train.py
+python train.py
 ```
 
 ### CUDA Errors
 
 If you have CUDA available but want to use CPU:
 ```bash
-python tutorial/train.py --device cpu
+python train.py --device cpu
 ```
 
 ### Memory Issues
 
 Reduce batch size or number of samples per prompt:
 ```bash
-python tutorial/train.py --batch_size 2 --num_samples_per_prompt 2
+python train.py --batch_size 2 --num_samples_per_prompt 2
 ```
 
 ## Next Steps

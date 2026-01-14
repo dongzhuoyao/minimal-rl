@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from tutorial.rewards.simple_reward import compute_shape_reward
+from rewards.simple_reward import compute_shape_reward
 
 def visualize_target_patterns():
     """Visualize the target patterns for each shape type."""
@@ -48,7 +48,7 @@ def visualize_target_patterns():
     plt.suptitle('Target Patterns for Shape Rewards', fontsize=16, fontweight='bold')
     plt.tight_layout()
     
-    output_dir = Path("tutorial/outputs")
+    output_dir = Path("outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_dir / "target_patterns.png", dpi=150, bbox_inches='tight')
     print(f"Saved target patterns to {output_dir / 'target_patterns.png'}")
@@ -118,7 +118,7 @@ def visualize_reward_computation():
     plt.suptitle('Reward Computation Examples', fontsize=16, fontweight='bold')
     plt.tight_layout()
     
-    output_dir = Path("tutorial/outputs")
+    output_dir = Path("outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_dir / "reward_examples.png", dpi=150, bbox_inches='tight')
     print(f"Saved reward examples to {output_dir / 'reward_examples.png'}")
@@ -156,4 +156,4 @@ if __name__ == "__main__":
     print("Creating reward computation examples...")
     visualize_reward_computation()
     
-    print("\nDone! Check tutorial/outputs/ for visualizations.")
+    print("\nDone! Check outputs/ for visualizations.")

@@ -23,7 +23,7 @@ This guide shows you how to run the FlowGRPO trainer in Google Colab.
 !pip install torch>=2.0.0 numpy>=1.24.0 matplotlib>=3.7.0 tqdm>=4.65.0 pillow>=10.0.0 scipy>=1.10.0
 
 # Run training
-exec(open('tutorial/colab_train.py').read())
+exec(open('colab_train.py').read())
 ```
 
 ### Method 3: Step-by-Step
@@ -44,7 +44,7 @@ exec(open('tutorial/colab_train.py').read())
 
 **Option B: Manual Upload**:
 - Use Colab's file menu: `File > Upload > Upload to session storage`
-- Upload the entire `tutorial/` directory structure
+- Upload the code files to the root directory
 
 #### Step 3: Setup and Run
 
@@ -57,23 +57,23 @@ import torch
 sys.path.insert(0, str(Path.cwd()))
 
 # Import
-from tutorial.dataset.dataset import PromptDataset
-from tutorial.dataset.generate_dataset import generate_dataset
-from tutorial.models.toy_flow_model import create_toy_model
-from tutorial.rewards.simple_reward import SimpleReward
-from tutorial.training.trainer import FlowGRPOTrainer
+from dataset.dataset import PromptDataset
+from dataset.generate_dataset import generate_dataset
+from models.toy_flow_model import create_toy_model
+from rewards.simple_reward import SimpleReward
+from training.trainer import FlowGRPOTrainer
 
 # Setup directories
 import os
-os.makedirs("tutorial/dataset", exist_ok=True)
-os.makedirs("tutorial/outputs", exist_ok=True)
+os.makedirs("dataset", exist_ok=True)
+os.makedirs("outputs", exist_ok=True)
 
 # Generate dataset
 generate_dataset()
 
 # Load datasets
-train_dataset = PromptDataset("tutorial/dataset", split="train")
-test_dataset = PromptDataset("tutorial/dataset", split="test")
+train_dataset = PromptDataset("dataset", split="train")
+test_dataset = PromptDataset("dataset", split="test")
 
 # Create model
 model, prompt_encoder = create_toy_model(
@@ -99,7 +99,7 @@ config = {
     "clip_range": 1e-4,
     "beta": 0.0,
     "device": device,
-    "output_dir": "tutorial/outputs",
+    "output_dir": "outputs",
     "eval_freq": 5,
     "max_grad_norm": 1.0,
 }
@@ -125,7 +125,7 @@ from IPython.display import Image, display
 from pathlib import Path
 
 # Display plots
-output_dir = Path("tutorial/outputs")
+output_dir = Path("outputs")
 if (output_dir / "training_curves.png").exists():
     display(Image(str(output_dir / "training_curves.png")))
 
@@ -139,7 +139,7 @@ for f in sorted(output_dir.glob("*")):
 Make sure you have this structure in Colab:
 
 ```
-tutorial/
+.
 ├── __init__.py
 ├── dataset/
 │   ├── __init__.py
@@ -165,7 +165,7 @@ tutorial/
 1. **GPU**: Colab provides free GPU - the code will automatically use CUDA if available
 2. **File Persistence**: Files uploaded to Colab are temporary. Download outputs if you want to keep them
 3. **Runtime**: Training takes ~5-10 minutes on GPU, ~20-30 minutes on CPU
-4. **Outputs**: Visualizations are saved to `tutorial/outputs/` directory
+4. **Outputs**: Visualizations are saved to `outputs/` directory
 
 ## Troubleshooting
 
@@ -205,9 +205,9 @@ from google.colab import files
 from pathlib import Path
 
 # Download specific file
-files.download('tutorial/outputs/training_curves.png')
+files.download('outputs/training_curves.png')
 
 # Or download entire outputs directory
-!zip -r outputs.zip tutorial/outputs/
+!zip -r outputs.zip outputs/
 files.download('outputs.zip')
 ```

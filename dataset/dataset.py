@@ -22,7 +22,7 @@ class PromptDataset(Dataset):
         if not prompt_file.exists():
             raise FileNotFoundError(
                 f"Dataset file not found: {prompt_file}. "
-                "Run python -m tutorial.dataset.generate_dataset first."
+                "Run python -m dataset.generate_dataset first."
             )
         
         with open(prompt_file, "r") as f:

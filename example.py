@@ -15,16 +15,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
-from tutorial.dataset.dataset import PromptDataset
-from tutorial.dataset.generate_dataset import generate_dataset
-from tutorial.models.toy_flow_model import create_toy_model
-from tutorial.rewards.simple_reward import SimpleReward
+from dataset.dataset import PromptDataset
+from dataset.generate_dataset import generate_dataset
+from models.toy_flow_model import create_toy_model
+from rewards.simple_reward import SimpleReward
 import matplotlib.pyplot as plt
 
 
 def main():
     # Generate dataset if needed
-    dataset_dir = Path("tutorial/dataset")
+    dataset_dir = Path("dataset")
     if not (dataset_dir / "train.txt").exists():
         print("Generating dataset...")
         generate_dataset()
@@ -92,7 +92,7 @@ def main():
     plt.suptitle("Example Generated Signals", fontsize=16)
     plt.tight_layout()
     
-    output_dir = Path("tutorial/outputs")
+    output_dir = Path("outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_dir / "example_signals.png", dpi=150)
     print(f"\nSaved visualization to {output_dir / 'example_signals.png'}")

@@ -2,7 +2,7 @@
 Main training script for FlowGRPO tutorial.
 
 Usage:
-    python tutorial/train.py
+    python train.py
 """
 import argparse
 from pathlib import Path
@@ -14,17 +14,17 @@ from pathlib import Path
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from tutorial.dataset.dataset import PromptDataset
-from tutorial.dataset.generate_dataset import generate_dataset
-from tutorial.models.toy_flow_model import create_toy_model
-from tutorial.rewards.simple_reward import SimpleReward
-from tutorial.training.trainer import FlowGRPOTrainer
+from dataset.dataset import PromptDataset
+from dataset.generate_dataset import generate_dataset
+from models.toy_flow_model import create_toy_model
+from rewards.simple_reward import SimpleReward
+from training.trainer import FlowGRPOTrainer
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train FlowGRPO on toy dataset")
-    parser.add_argument("--dataset_dir", type=str, default="tutorial/dataset", help="Dataset directory")
-    parser.add_argument("--output_dir", type=str, default="tutorial/outputs", help="Output directory")
+    parser.add_argument("--dataset_dir", type=str, default="dataset", help="Dataset directory")
+    parser.add_argument("--output_dir", type=str, default="outputs", help="Output directory")
     parser.add_argument("--num_epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--num_samples_per_prompt", type=int, default=4, help="Samples per prompt")

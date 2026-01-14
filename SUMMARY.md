@@ -44,7 +44,7 @@ A complete tutorial codebase for learning FlowGRPO with:
 ### 📁 File Structure
 
 ```
-tutorial/
+.
 ├── README.md              # Main documentation
 ├── QUICKSTART.md          # Quick start guide
 ├── requirements.txt       # Dependencies
@@ -90,12 +90,12 @@ tutorial/
 
 ### Basic Training
 ```bash
-python tutorial/train.py --num_epochs 20
+python train.py --num_epochs 20
 ```
 
 ### Custom Configuration
 ```bash
-python tutorial/train.py \
+python train.py \
     --num_epochs 50 \
     --batch_size 8 \
     --learning_rate 1e-3 \
@@ -104,7 +104,7 @@ python tutorial/train.py \
 
 ### Quick Example
 ```bash
-python tutorial/example.py
+python example.py
 ```
 
 ## Outputs

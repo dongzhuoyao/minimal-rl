@@ -8,10 +8,10 @@ from tqdm import tqdm
 import os
 from pathlib import Path
 
-from tutorial.models.toy_flow_model import create_toy_model
-from tutorial.rewards.simple_reward import SimpleReward
-from tutorial.training.grpo import compute_group_advantages, compute_grpo_loss
-from tutorial.visualization.plotter import TrainingPlotter
+from models.toy_flow_model import create_toy_model
+from rewards.simple_reward import SimpleReward
+from training.grpo import compute_group_advantages, compute_grpo_loss
+from visualization.plotter import TrainingPlotter
 
 
 class FlowGRPOTrainer:
