@@ -96,62 +96,82 @@ def main(cfg: DictConfig):
         num_workers=cfg.training.num_workers,
     )
     
-    best_test_loss = float('inf')
+    # Create iterator that cycles through the data loader
+    train_iter = iter(train_loader)
     
-    for epoch in range(cfg.training.num_epochs):
+    best_test_loss = float('inf')
+    step = 0
+    running_train_loss = 0.0
+    loss_count = 0
+    
+    # Training loop - step-based
+    pbar = tqdm(total=cfg.training.num_steps, desc="Training")
+    
+    while step < cfg.training.num_steps:
         # Training phase
         model.train()
         prompt_encoder.train()
-        train_losses = []
         
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg.training.num_epochs}"):
-            images = batch["image"].to(device)  # [batch_size, 784]
-            labels = batch["label"].to(device)  # [batch_size]
-            
-            # Encode prompts
-            prompt_embeds = prompt_encoder(labels)  # [batch_size, prompt_dim]
-            
-            # Flow matching loss computation
-            batch_size = images.shape[0]
-            
-            # Sample random time t uniformly from [0, 1]
-            t = torch.rand(batch_size, 1, device=device)  # [batch_size, 1]
-            
-            # Sample noise x_1 ~ N(0, I)
-            noise = torch.randn_like(images)  # [batch_size, 784]
-            
-            # Interpolate: x_t = (1-t) * x_0 + t * x_1
-            # where x_0 = data (images) and x_1 = noise
-            x_t = (1 - t) * images + t * noise  # [batch_size, 784]
-            
-            # Target velocity: v_target = x_1 - x_0 = noise - images
-            v_target = noise - images  # [batch_size, 784]
-            
-            # Predict velocity: v_pred = model(x_t, t, prompt_embed)
-            v_pred = model(x_t, t, prompt_embeds)  # [batch_size, 784]
-            
-            # Flow matching loss: L = ||v_pred - v_target||^2
-            loss = nn.functional.mse_loss(v_pred, v_target, reduction='mean')
-            
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            
-            # Gradient clipping
-            if cfg.training.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    list(model.parameters()) + list(prompt_encoder.parameters()),
-                    cfg.training.max_grad_norm,
-                )
-            
-            optimizer.step()
-            
-            train_losses.append(loss.item())
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            # Reset iterator when exhausted
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
         
-        avg_train_loss = sum(train_losses) / len(train_losses)
+        images = batch["image"].to(device)  # [batch_size, 784]
+        labels = batch["label"].to(device)  # [batch_size]
+        
+        # Encode prompts
+        prompt_embeds = prompt_encoder(labels)  # [batch_size, prompt_dim]
+        
+        # Flow matching loss computation
+        batch_size = images.shape[0]
+        
+        # Sample random time t uniformly from [0, 1]
+        t = torch.rand(batch_size, 1, device=device)  # [batch_size, 1]
+        
+        # Sample noise x_1 ~ N(0, I)
+        noise = torch.randn_like(images)  # [batch_size, 784]
+        
+        # Interpolate: x_t = (1-t) * x_0 + t * x_1
+        # where x_0 = data (images) and x_1 = noise
+        x_t = (1 - t) * images + t * noise  # [batch_size, 784]
+        
+        # Target velocity: v_target = x_1 - x_0 = noise - images
+        v_target = noise - images  # [batch_size, 784]
+        
+        # Predict velocity: v_pred = model(x_t, t, prompt_embed)
+        v_pred = model(x_t, t, prompt_embeds)  # [batch_size, 784]
+        
+        # Flow matching loss: L = ||v_pred - v_target||^2
+        loss = nn.functional.mse_loss(v_pred, v_target, reduction='mean')
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # Gradient clipping
+        if cfg.training.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(prompt_encoder.parameters()),
+                cfg.training.max_grad_norm,
+            )
+        
+        optimizer.step()
+        
+        # Update running statistics
+        running_train_loss += loss.item()
+        loss_count += 1
+        step += 1
+        pbar.update(1)
         
         # Evaluation phase
-        if (epoch + 1) % cfg.training.eval_freq == 0:
+        if step % cfg.training.eval_freq == 0:
+            avg_train_loss = running_train_loss / loss_count
+            running_train_loss = 0.0
+            loss_count = 0
+            
             model.eval()
             prompt_encoder.eval()
             test_losses = []
@@ -175,7 +195,7 @@ def main(cfg: DictConfig):
             
             avg_test_loss = sum(test_losses) / len(test_losses)
             
-            print(f"\nEpoch {epoch+1}/{cfg.training.num_epochs}")
+            print(f"\nStep {step}/{cfg.training.num_steps}")
             print(f"Train Loss: {avg_train_loss:.6f}")
             print(f"Test Loss: {avg_test_loss:.6f}")
             
@@ -183,7 +203,7 @@ def main(cfg: DictConfig):
             if avg_test_loss < best_test_loss:
                 best_test_loss = avg_test_loss
                 checkpoint = {
-                    'epoch': epoch + 1,
+                    'step': step,
                     'model_state_dict': model.state_dict(),
                     'prompt_encoder_state_dict': prompt_encoder.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
@@ -191,9 +211,13 @@ def main(cfg: DictConfig):
                 }
                 torch.save(checkpoint, output_dir / 'best_model.pt')
                 print(f"Saved best model (test loss: {avg_test_loss:.6f})")
-        else:
-            print(f"\nEpoch {epoch+1}/{cfg.training.num_epochs}")
-            print(f"Train Loss: {avg_train_loss:.6f}")
+        
+        # Update progress bar
+        if step % 10 == 0:  # Update every 10 steps
+            current_avg_loss = running_train_loss / loss_count if loss_count > 0 else 0.0
+            pbar.set_postfix({'loss': f'{current_avg_loss:.6f}'})
+    
+    pbar.close()
     
     print(f"\nTraining complete! Best test loss: {best_test_loss:.6f}")
     print(f"Checkpoints saved in {output_dir}")
