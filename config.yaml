@@ -1,7 +1,7 @@
 # Single Hydra config file for FlowGRPO tutorial
 
 # Run name for logging and outputs
-run_name: "flowgrpo_tutorial"
+run_name: "flowgrpo"
 
 # Random seed for reproducibility
 seed: 42
@@ -47,7 +47,7 @@ paths:
 
 # Wandb configuration
 wandb:
-  enabled: false  # Set to true to enable wandb logging
+  enabled: true  # Set to true to enable wandb logging
   project: "minimal-rl"
   run_name: null  # Uses run_name from top level if null
   tags: []  # Optional tags for the run
