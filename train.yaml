@@ -38,7 +38,7 @@ training:
   save_freq: 1000  # Frequency of checkpoint saving (in steps)
 
 # Checkpoint configuration
-pretrained_checkpoint: "./outputs/2026-01-15/22-22-15/checkpoints/iter_001000.pt"  # Path to pretrained checkpoint
+pretrained_checkpoint: "./outputs/2026-01-15/22-22-15/checkpoints/iter_004500.pt"  # Path to pretrained checkpoint
 resume_from: null  # Path to checkpoint to resume training from (loads optimizer state too)
 
 # Reward configuration
