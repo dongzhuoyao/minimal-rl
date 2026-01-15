@@ -220,28 +220,33 @@ class PerLabelStatTracker:
         self.stats = {}
 
 
-def sample_with_logprob(model, labels, num_steps, device, return_trajectory=False, enable_grad=False):
+def sample_with_logprob(model, labels, num_steps, device, return_trajectory=False, enable_grad=False, sigma_max=80.0):
     """
     Sample trajectories with log probabilities for GRPO training.
     
-    This function implements the flow matching sampling process:
-    1. Initialize: x_0 ~ N(0, I)
+    This function implements the flow matching sampling process using vector fields:
+    1. Initialize: x_0 ~ N(0, I) (start from noise)
     2. For each step t in [0, 1]:
-       - Predict velocity: v = model(x_t, t, labels)
-       - Update state: x_{t+1} = x_t + dt * v
+       - Convert time to sigma: sigma = t * sigma_max
+       - Predict velocity field: v = model(x_t, sigma, labels)
+       - Update state: x_{t+1} = x_t + dt * v (Euler integration)
        - Compute log prob: log p ≈ -0.5 * ||v||² * dt
     3. Return final images and log probabilities
+    
+    Flow matching uses a vector field (velocity field) to transform noise to data.
+    The model predicts the velocity v_θ(x_t, sigma, label) that guides the flow.
     
     The log probabilities are used in the GRPO loss to compute importance
     ratios: ratio = exp(log p_new - log p_old)
     
     Args:
-        model: Flow matching model (predicts velocity field v_θ(x, t, label))
+        model: Flow matching model (predicts velocity field v_θ(x, sigma, label))
         labels: [B] class labels (0-9 for MNIST)
         num_steps: Number of Euler integration steps
         device: Device to run on ('cpu' or 'cuda')
         return_trajectory: If True, return full trajectory (all intermediate states)
         enable_grad: If True, enable gradients (for training phase sampling)
+        sigma_max: Maximum noise level (sigma = t * sigma_max, where t ∈ [0, 1])
     
     Returns:
         final_images: [B, 1, 28, 28] final generated images in [0, 1] range
@@ -255,69 +260,58 @@ def sample_with_logprob(model, labels, num_steps, device, return_trajectory=Fals
     signal_dim = 784  # MNIST: 28x28 = 784
     img_size = 28
     
-    # Initialize with noise (flattened)
-    x = torch.randn(B, signal_dim, device=device)
+    # Initialize with noise: x_1 ~ N(0, I) (matching train0.py)
+    # Use image format [B, 1, 28, 28] directly (matching train0.py)
+    x = torch.randn(B, 1, img_size, img_size, device=device)
     
-    trajectory = [x.clone()] if return_trajectory else None
+    trajectory = [x.clone().view(B, signal_dim)] if return_trajectory else None
     log_probs = []
     timesteps = []
     
     # Euler integration
     dt = 1.0 / num_steps
-    t = torch.zeros(B, 1, device=device)
     
-    # Karras schedule parameters (matching model.py)
-    sigma_min, sigma_max = 0.002, 80.0
-    rho = 7.0
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
+    # Time steps from 1 to 0 (backwards, matching train0.py)
+    timesteps_list = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
     
     context = torch.enable_grad() if enable_grad else torch.no_grad()
     with context:
         for step in range(num_steps):
-            # Reshape x to image format [B, 1, 28, 28]
-            x_img = x.view(B, 1, img_size, img_size)
+            # Current time t (from 1.0 to 0.0)
+            t = timesteps_list[step]
             
-            # Convert time t to sigma using Karras schedule
-            t_flat = t.squeeze(-1) if t.dim() > 1 else t  # [B]
-            sigma = (max_inv_rho + t_flat * (min_inv_rho - max_inv_rho)) ** rho  # [B]
+            # Convert time t to sigma: sigma = t * sigma_max
+            # t goes from 1.0 to 0.0, sigma goes from sigma_max to 0
+            sigma = t * sigma_max  # scalar or broadcast to [B]
+            if isinstance(sigma, torch.Tensor) and sigma.dim() == 0:
+                sigma = sigma.item()
             
-            # Compute velocity using SimpleUNet
-            v_img = model(x_img, sigma, labels)  # [B, 1, 28, 28]
-            
-            # Reshape velocity back to flattened format
-            v = v_img.view(B, signal_dim)  # [B, signal_dim]
+            # Predict velocity (matching train0.py)
+            v_pred = model(x, sigma, labels)  # [B, 1, 28, 28]
             
             # Compute log probability for this step
             # For flow matching: log p ≈ -0.5 * ||v||^2 * dt
-            log_prob = -0.5 * torch.sum(v ** 2, dim=-1) * dt
+            v_flat = v_pred.view(B, signal_dim)  # [B, signal_dim]
+            log_prob = -0.5 * torch.sum(v_flat ** 2, dim=-1) * dt
             log_probs.append(log_prob)
-            timesteps.append(t.clone())
+            timesteps.append(torch.full((B,), t, device=device))
             
-            # Update x
-            x_new = x + dt * v
+            # Euler step: x_{t-dt} = x_t - dt * v_pred (matching train0.py)
+            # Going backwards in time: subtract velocity
+            x = x - dt * v_pred
             
-            # Update x
-            x = x_new
-            
-            # Update time
-            t = t + dt
-            
-            # Store trajectory if needed
+            # Store trajectory if needed (flattened for consistency)
             if return_trajectory:
-                trajectory.append(x.clone())
+                trajectory.append(x.clone().view(B, signal_dim))
     
     log_probs = torch.stack(log_probs, dim=1)  # [B, num_steps]
-    timesteps = torch.cat(timesteps, dim=1)  # [B, num_steps]
+    timesteps = torch.stack(timesteps, dim=1)  # [B, num_steps] - each row is the same t value
     
-    # Reshape final images to [B, 1, 28, 28]
-    final_images = x.view(B, 1, img_size, img_size)
+    # Final images are already in [B, 1, 28, 28] format
+    final_images = x
     
-    # Normalize to [-1, 1] range (standard for flow matching models)
-    # Then convert to [0, 1] range expected by reward functions
-    final_images = torch.tanh(final_images)  # Normalize to [-1, 1]
-    final_images = (final_images + 1.0) / 2.0  # Convert [-1, 1] -> [0, 1]
-    final_images = torch.clamp(final_images, 0.0, 1.0)  # Ensure valid range
+    # Clamp to valid range [0, 1] for MNIST (matching train0.py)
+    final_images = torch.clamp(final_images, 0.0, 1.0)
     
     if return_trajectory:
         return final_images, trajectory, log_probs, timesteps
@@ -325,16 +319,17 @@ def sample_with_logprob(model, labels, num_steps, device, return_trajectory=Fals
         return final_images, log_probs, timesteps
 
 
-def compute_log_prob_at_timestep(model, x_t, t, labels, x_next, dt):
+def compute_log_prob_at_timestep(model, x_t, t, labels, x_next, dt, sigma_max=80.0):
     """
     Compute log probability of transitioning from x_t to x_next at timestep t.
     
     This is used during training to compute the new policy's log probability
     for importance sampling. The log probability is approximated as:
     
-        log p(x_{t+1} | x_t) ≈ -0.5 * ||v_pred||² * dt
+        log p(x_{t-dt} | x_t) ≈ -0.5 * ||v_pred||² * dt
     
     where v_pred = model(x_t_img, sigma, labels) is the predicted velocity.
+    Note: We go backwards in time (t: 1.0 → 0.0), so x_next = x_t - dt * v_pred.
     
     This function is called for each timestep in the trajectory during training
     to compute log p_new, which is then compared to log p_old (from sampling)
@@ -343,10 +338,11 @@ def compute_log_prob_at_timestep(model, x_t, t, labels, x_next, dt):
     Args:
         model: SimpleUNet model (predicts velocity field)
         x_t: [B, signal_dim] current state at timestep t (flattened)
-        t: [B, 1] current time value in [0, 1]
+        t: [B] or [B, 1] current time value (from 1.0 to 0.0, matching train0.py)
         labels: [B] class labels (0-9 for MNIST)
-        x_next: [B, signal_dim] next state (from stored trajectory)
+        x_next: [B, signal_dim] next state (from stored trajectory, x_{t-dt})
         dt: Time step size (1.0 / num_steps)
+        sigma_max: Maximum noise level (default 80.0, matching train0.py)
     
     Returns:
         log_prob: [B] log probabilities for each sample in batch
@@ -355,18 +351,18 @@ def compute_log_prob_at_timestep(model, x_t, t, labels, x_next, dt):
     signal_dim = x_t.shape[1]
     img_size = int(signal_dim ** 0.5)  # Assume square images
     
-    # Reshape x_t to image format [B, 1, 28, 28]
+    # Reshape x_t to image format [B, 1, 28, 28] (matching train0.py format)
     x_t_img = x_t.view(B, 1, img_size, img_size)
     
-    # Convert time t to sigma using Karras schedule
+    # Convert time t to sigma: sigma = t * sigma_max
+    # t goes from 1.0 to 0.0, sigma goes from sigma_max to 0
     t_flat = t.squeeze(-1) if t.dim() > 1 else t  # [B]
-    sigma_min, sigma_max = 0.002, 80.0
-    rho = 7.0
-    min_inv_rho = sigma_min ** (1 / rho)
-    max_inv_rho = sigma_max ** (1 / rho)
-    sigma = (max_inv_rho + t_flat * (min_inv_rho - max_inv_rho)) ** rho  # [B]
+    if isinstance(t_flat, torch.Tensor):
+        sigma = t_flat * sigma_max  # [B]
+    else:
+        sigma = t_flat * sigma_max  # scalar
     
-    # Predict velocity using SimpleUNet
+    # Predict velocity (vector field) using SimpleUNet (matching train0.py)
     v_pred_img = model(x_t_img, sigma, labels)  # [B, 1, 28, 28]
     
     # Reshape velocity back to flattened format
@@ -614,6 +610,7 @@ def main(cfg: DictConfig):
                 num_steps=cfg.training.num_steps,
                 device=device,
                 return_trajectory=False,
+                sigma_max=cfg.model.get("sigma_max", 80.0),
             )
         
         # Compute rewards
@@ -624,6 +621,135 @@ def main(cfg: DictConfig):
         reward_prompts = [f"digit {label.item()}" for label in expanded_labels]
         
         rewards = reward_fn(images_for_reward, reward_prompts)  # [batch_size * num_samples_per_label]
+        
+        # Visualize sampled images in wandb periodically
+        if cfg.wandb.enabled and step % cfg.wandb.log_freq == 0:
+            try:
+                # Create grid of sampled images with rewards
+                num_images_to_show = min(16, images_for_reward.shape[0])
+                if num_images_to_show == 0:
+                    continue
+                    
+                images_to_grid = []
+                captions = []
+                rewards_cpu = rewards.cpu()
+                for i in range(num_images_to_show):
+                    # Extract image maintaining channel dimension
+                    img = images_for_reward[i:i+1].cpu()  # [1, 1, 28, 28] - keep batch dim
+                    img = img.squeeze(0)  # [1, 28, 28] - remove batch dim but keep channel
+                    
+                    # Ensure image has correct shape [1, 28, 28]
+                    if img.dim() == 2:
+                        # [28, 28] -> [1, 28, 28]
+                        img = img.unsqueeze(0)
+                    elif img.dim() == 3:
+                        if img.shape[0] != 1:
+                            # If shape is [28, 28, 1] or [28, 28, C], fix it
+                            if img.shape[2] == 1:
+                                img = img.permute(2, 0, 1)  # [28, 28, 1] -> [1, 28, 28]
+                            elif img.shape[0] == 28 and img.shape[1] == 28:
+                                img = img[:, :, 0].unsqueeze(0) if img.shape[2] > 1 else img.unsqueeze(0)
+                    
+                    # Final validation - ensure [1, 28, 28]
+                    if img.dim() == 2:
+                        img = img.unsqueeze(0)
+                    if img.dim() != 3 or img.shape[0] != 1:
+                        # Force to [1, 28, 28]
+                        if img.dim() == 2:
+                            img = img.unsqueeze(0)
+                        elif img.dim() == 3 and img.shape[0] != 1:
+                            if img.shape[0] == 28:
+                                img = img.unsqueeze(0)
+                            else:
+                                print(f"Warning: Cannot fix image {i} shape {img.shape}, skipping")
+                                continue
+                    
+                    images_to_grid.append(img)
+                    label = expanded_labels[i].item()
+                    reward = rewards_cpu[i].item()
+                    captions.append(f"L:{label} R:{reward:.4f}")
+                
+                if len(images_to_grid) == 0:
+                    continue
+                
+                # Stack images and create grid
+                images_tensor = torch.cat(images_to_grid, dim=0)  # Should be [N, 1, 28, 28]
+                
+                # Fix shape if needed
+                if images_tensor.dim() == 3:
+                    # [N, 28, 28] -> [N, 1, 28, 28]
+                    images_tensor = images_tensor.unsqueeze(1)
+                elif images_tensor.dim() != 4:
+                    print(f"Error: images_tensor has {images_tensor.dim()} dimensions, expected 4. Shape: {images_tensor.shape}")
+                    continue
+                
+                # Ensure channel dimension is 1
+                if images_tensor.shape[1] != 1:
+                    if images_tensor.shape[1] == 28 and images_tensor.shape[2] == 28:
+                        # [N, 28, 28, C] or similar - reshape
+                        images_tensor = images_tensor.unsqueeze(1) if images_tensor.dim() == 3 else images_tensor
+                    else:
+                        print(f"Error: images_tensor channel dimension is {images_tensor.shape[1]}, expected 1. Shape: {images_tensor.shape}")
+                        continue
+                
+                if images_tensor.shape[1] != 1:
+                    print(f"Error: images_tensor channel dimension is {images_tensor.shape[1]}, expected 1. Shape: {images_tensor.shape}")
+                    continue
+                
+                # Ensure images are in [0, 1] range
+                images_tensor = torch.clamp(images_tensor, 0.0, 1.0)
+                
+                grid = make_grid(images_tensor, nrow=4, normalize=False, pad_value=1.0)  # [3, H, W] - make_grid converts grayscale to RGB
+                
+                # Debug: Check grid shape
+                if grid.dim() != 3:
+                    print(f"Error: grid has {grid.dim()} dimensions, expected 3. Shape: {grid.shape}, input shape: {images_tensor.shape}")
+                    continue
+                
+                if grid.shape[0] != 3:
+                    print(f"Error: grid first dimension is {grid.shape[0]}, expected 3. Shape: {grid.shape}, input shape: {images_tensor.shape}")
+                    continue
+                
+                # Convert to numpy: [C, H, W] -> [H, W, C]
+                grid_np = grid.permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
+                
+                # Final shape check before PIL conversion
+                if len(grid_np.shape) != 3:
+                    print(f"Error: grid_np has {len(grid_np.shape)} dimensions after permute, expected 3. Shape: {grid_np.shape}")
+                    continue
+                
+                if grid_np.shape[2] != 3:
+                    print(f"Error: grid_np channel dimension is {grid_np.shape[2]}, expected 3. Shape: {grid_np.shape}, original grid shape: {grid.shape}")
+                    continue
+                
+                if grid_np.shape[0] < 10 or grid_np.shape[1] < 10:
+                    print(f"Error: grid_np spatial dimensions too small: {grid_np.shape}, original grid shape: {grid.shape}")
+                    continue
+                
+                grid_np = np.clip(grid_np, 0.0, 1.0)
+                grid_np = (grid_np * 255).astype(np.uint8)
+                
+                grid_pil = Image.fromarray(grid_np, mode='RGB')
+                
+                # Record image statistics
+                img_min = images_for_reward.min().item()
+                img_max = images_for_reward.max().item()
+                img_mean = images_for_reward.mean().item()
+                img_std = images_for_reward.std().item()
+                
+                caption_text = " | ".join(captions)
+                wandb.log({
+                    "sampling/generated_images": wandb.Image(grid_pil, caption=caption_text),
+                    "sampling/image_min": img_min,
+                    "sampling/image_max": img_max,
+                    "sampling/image_mean": img_mean,
+                    "sampling/image_std": img_std,
+                }, step=step)
+            except Exception as e:
+                print(f"Warning: Failed to visualize images at step {step}: {e}")
+                import traceback
+                traceback.print_exc()
+        
         rewards = rewards.cpu().numpy()
         
         # ====================================================================
@@ -662,6 +788,7 @@ def main(cfg: DictConfig):
                 device=device,
                 return_trajectory=True,
                 enable_grad=False,
+                sigma_max=cfg.model.get("sigma_max", 80.0),
             )
         
         # Store samples with trajectories
@@ -736,8 +863,10 @@ def main(cfg: DictConfig):
                     t = timesteps_tensor[:, j:j+1]  # [B, 1]
                     
                     # Compute new log probability
+                    # Note: trajectories are stored backwards (t: 1.0 → 0.0), matching train0.py
                     log_prob_new = compute_log_prob_at_timestep(
-                        model, x_t, t, batch_labels, x_next, dt
+                        model, x_t, t, batch_labels, x_next, dt,
+                        sigma_max=cfg.model.get("sigma_max", 80.0)
                     )  # [B]
                     
                     # Get old log probability for this timestep
@@ -826,13 +955,16 @@ def main(cfg: DictConfig):
                 
                 # Logging
                 if cfg.wandb.enabled and step % cfg.wandb.log_freq == 0:
+                    batch_rewards = [s["reward"] for s in batch_samples]
+                    mean_reward = np.mean(batch_rewards)
+                    
                     log_dict = {
                         "train/loss": total_loss.item(),
                         "train/policy_loss": np.mean(info["policy_loss"]),
                         "train/approx_kl": np.mean(info["approx_kl"]),
                         "train/clipfrac": np.mean(info["clipfrac"]),
                         "train/learning_rate": optimizer.param_groups[0]['lr'],
-                        "train/mean_reward": np.mean([s["reward"] for s in batch_samples]),
+                        "train/mean_reward": mean_reward,
                         "train/mean_advantage": advantages_clipped.mean().item(),
                         "step": step,
                     }
@@ -857,14 +989,37 @@ def main(cfg: DictConfig):
                     
                     # Stack images and create grid
                     images_tensor = torch.cat(images_to_grid, dim=0)  # [N, 1, 28, 28]
-                    grid = make_grid(images_tensor, nrow=4, normalize=False, pad_value=1.0)
-                    # Convert to numpy for wandb
-                    grid_np = grid.permute(1, 2, 0).cpu().numpy()  # [H, W, C]
+                    
+                    # Ensure proper shape
+                    if images_tensor.dim() != 4 or images_tensor.shape[1] != 1:
+                        print(f"Warning: Unexpected train images_tensor shape {images_tensor.shape}")
+                        continue
+                    
+                    grid = make_grid(images_tensor, nrow=4, normalize=False, pad_value=1.0)  # [3, H, W] - make_grid converts grayscale to RGB
+                    
+                    if grid.dim() != 3 or grid.shape[0] != 3:
+                        print(f"Warning: Unexpected train grid shape {grid.shape}")
+                        continue
+                    
+                    # Convert to numpy: [C, H, W] -> [H, W, C]
+                    grid_np = grid.permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
+                    
+                    if grid_np.shape[2] != 3 or grid_np.shape[0] < 10 or grid_np.shape[1] < 10:
+                        print(f"Warning: Invalid train grid_np shape {grid_np.shape}")
+                        continue
+                    
                     grid_np = np.clip(grid_np, 0.0, 1.0)
                     grid_np = (grid_np * 255).astype(np.uint8)
-                    grid_pil = Image.fromarray(grid_np, mode='RGB')
                     
+                    grid_pil = Image.fromarray(grid_np, mode='RGB')
                     log_dict["train/sampled_images"] = wandb.Image(grid_pil, caption="Training samples (Label, Reward, Advantage)")
+                    
+                    # Record image statistics from batch samples
+                    batch_images = torch.stack([s["image"] for s in batch_samples])
+                    log_dict["train/image_min"] = batch_images.min().item()
+                    log_dict["train/image_max"] = batch_images.max().item()
+                    log_dict["train/image_mean"] = batch_images.mean().item()
+                    log_dict["train/image_std"] = batch_images.std().item()
                     
                     wandb.log(log_dict, step=step)
                 
@@ -880,20 +1035,48 @@ def main(cfg: DictConfig):
                                 test_labels,
                                 num_steps=cfg.training.eval_num_steps,
                                 device=device,
+                                sigma_max=cfg.model.get("sigma_max", 80.0),
                             )
                             # Images are already in [0, 1] range from sample_with_logprob
                             
                             # Create grid of evaluation images
-                            eval_grid = make_grid(test_images, nrow=4, normalize=False, pad_value=1.0)
-                            # Convert to numpy for wandb
-                            eval_grid_np = eval_grid.permute(1, 2, 0).cpu().numpy()  # [H, W, C]
+                            if test_images.dim() != 4 or test_images.shape[1] != 1:
+                                print(f"Warning: Unexpected eval test_images shape {test_images.shape}")
+                                continue
+                            
+                            eval_grid = make_grid(test_images, nrow=4, normalize=False, pad_value=1.0)  # [3, H, W] - make_grid converts grayscale to RGB
+                            
+                            if eval_grid.dim() != 3 or eval_grid.shape[0] != 3:
+                                print(f"Warning: Unexpected eval grid shape {eval_grid.shape}")
+                                continue
+                            
+                            # Convert to numpy: [C, H, W] -> [H, W, C]
+                            eval_grid_np = eval_grid.permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
+                            
+                            if eval_grid_np.shape[2] != 3 or eval_grid_np.shape[0] < 10 or eval_grid_np.shape[1] < 10:
+                                print(f"Warning: Invalid eval grid_np shape {eval_grid_np.shape}")
+                                continue
+                            
                             eval_grid_np = np.clip(eval_grid_np, 0.0, 1.0)
                             eval_grid_np = (eval_grid_np * 255).astype(np.uint8)
+                            
                             eval_grid_pil = Image.fromarray(eval_grid_np, mode='RGB')
+                            
+                            # Record evaluation image statistics
+                            eval_img_min = test_images.min().item()
+                            eval_img_max = test_images.max().item()
+                            eval_img_mean = test_images.mean().item()
+                            eval_img_std = test_images.std().item()
                             
                             # Create caption with labels
                             label_captions = ", ".join([f"L{i}:{test_labels[i].item()}" for i in range(len(test_labels))])
-                            wandb.log({"eval/sampled_images": wandb.Image(eval_grid_pil, caption=f"Evaluation samples - {label_captions}")}, step=step)
+                            wandb.log({
+                                "eval/sampled_images": wandb.Image(eval_grid_pil, caption=f"Evaluation samples - {label_captions}"),
+                                "eval/image_min": eval_img_min,
+                                "eval/image_max": eval_img_max,
+                                "eval/image_mean": eval_img_mean,
+                                "eval/image_std": eval_img_std,
+                            }, step=step)
                         model.train()
                     
                     # Save checkpoint

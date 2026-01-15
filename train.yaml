@@ -17,6 +17,7 @@ model:
   prompt_dim: 32
   hidden_dim: 256  # Increased for MNIST complexity
   vocab_size: 10   # Digits 0-9
+  sigma_max: 80.0  # Maximum noise level for flow matching (sigma = t * sigma_max)
 
 # Training hyperparameters
 training:
