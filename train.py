@@ -973,20 +973,20 @@ def main(cfg: DictConfig):
                 # Logging
                 if cfg.wandb.enabled and step % cfg.wandb.log_freq == 0:
                     batch_rewards = [s["reward"] for s in batch_samples]
-                    mean_reward = np.mean(batch_rewards)
+                    mean_reward = float(np.mean(batch_rewards))
                     
                     log_dict = {
-                        "train/loss": total_loss.item(),
-                        "train/policy_loss": np.mean(info["policy_loss"]),
-                        "train/approx_kl": np.mean(info["approx_kl"]),
-                        "train/clipfrac": np.mean(info["clipfrac"]),
-                        "train/learning_rate": optimizer.param_groups[0]['lr'],
+                        "train/loss": float(total_loss.item()),
+                        "train/policy_loss": float(np.mean(info["policy_loss"])),
+                        "train/approx_kl": float(np.mean(info["approx_kl"])),
+                        "train/clipfrac": float(np.mean(info["clipfrac"])),
+                        "train/learning_rate": float(optimizer.param_groups[0]['lr']),
                         "train/mean_reward": mean_reward,
-                        "train/mean_advantage": advantages_clipped.mean().item(),
+                        "train/mean_advantage": float(advantages_clipped.mean().item()),
                         "step": step,
                     }
                     if beta > 0:
-                        log_dict["train/kl_loss"] = np.mean(info["kl_loss"])
+                        log_dict["train/kl_loss"] = float(np.mean(info["kl_loss"]))
 
                     print(log_dict)
                     
