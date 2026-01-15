@@ -84,7 +84,7 @@ python train.py training=gpu model=large
 python train.py training.num_epochs=200 training.learning_rate=0.0005
 
 # Override multiple parameters
-python train.py training.batch_size=16 training.num_samples_per_prompt=8 model.hidden_dim=256
+python train.py training.batch_size=16 training.num_samples_per_label=8 model.hidden_dim=256
 ```
 
 See `config/README.md` for detailed configuration documentation.

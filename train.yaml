@@ -22,7 +22,7 @@ model:
 training:
   max_steps: 100000  # Maximum number of training steps
   batch_size: 4
-  num_samples_per_prompt: 4
+  num_samples_per_label: 4
   num_steps: 20  # Number of flow matching steps per sample
   eval_num_steps: 20  # Number of flow matching steps for evaluation
   lr: 1e-3
