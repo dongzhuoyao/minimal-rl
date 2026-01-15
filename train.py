@@ -725,6 +725,8 @@ def main(cfg: DictConfig):
                     }
                     if beta > 0:
                         log_dict["train/kl_loss"] = np.mean(info["kl_loss"])
+
+                    print(log_dict)
                     
                     # Visualize sampled images during training using make_grid
                     num_images_to_log = min(16, len(batch_samples))
