@@ -205,7 +205,7 @@ def compute_log_prob_at_timestep(model, x_t, t, labels, x_next, dt):
     return log_prob
 
 
-@hydra.main(version_base=None, config_path=".", config_name="config")
+@hydra.main(version_base=None, config_path=".", config_name="train")
 def main(cfg: DictConfig):
     """Main FloWGRPO training function with Hydra configuration."""
     
@@ -274,6 +274,7 @@ def main(cfg: DictConfig):
         model.load_state_dict(checkpoint['model_state_dict'])
         print("Checkpoint loaded successfully!")
     else:
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
         print(f"Warning: Checkpoint not found at {checkpoint_path}. Starting from scratch.")
     
     # Setup optimizer

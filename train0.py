@@ -28,9 +28,10 @@ from dataset import MNISTDataset
 from model import SimpleUNet
 import numpy as np
 from PIL import Image
+from torchvision.utils import make_grid
 
 
-@hydra.main(version_base=None, config_path=".", config_name="config0")
+@hydra.main(version_base=None, config_path=".", config_name="train0")
 def main(cfg: DictConfig):
     """Main training function with Hydra configuration."""
     
@@ -356,19 +357,37 @@ def main(cfg: DictConfig):
             print(f"Test Loss: {avg_test_loss:.6f} ± {test_loss_std:.6f}")
             
             # Sample images for visualization
-            if cfg.wandb.enabled:
-                num_samples = cfg.wandb.get("num_sample_images", 8)
-                sampled_images, sampled_labels = sample_images(
-                    model, 
-                    num_samples=num_samples,
-                    num_steps=cfg.wandb.get("num_sampling_steps", 50),
-                    sigma_max=cfg.model.get("sigma_max", 80.0),
-                    device=device
-                )
-                wandb_images = images_to_wandb(sampled_images, sampled_labels, num_samples)
+            num_samples = cfg.wandb.get("num_sample_images", 8) if cfg.wandb.enabled else 8
+            sampled_images, sampled_labels = sample_images(
+                model, 
+                num_samples=num_samples,
+                num_steps=cfg.wandb.get("num_sampling_steps", 50) if cfg.wandb.enabled else 50,
+                sigma_max=cfg.model.get("sigma_max", 80.0),
+                device=device
+            )
+            
+            # Save sampled images as grid using make_grid
+            # make_grid expects images in [0, 1] range, which we already have
+            grid = make_grid(sampled_images, nrow=4, normalize=False, pad_value=1.0)
+            # Convert grid to PIL Image and save
+            grid_np = grid.permute(1, 2, 0).cpu().numpy()  # [H, W, C]
+            grid_np = np.clip(grid_np, 0.0, 1.0)
+            grid_np = (grid_np * 255).astype(np.uint8)
+            # For grayscale, convert to RGB for PIL
+            if grid_np.shape[2] == 1:
+                grid_np = grid_np.repeat(3, axis=2)  # [H, W, 3]
+            grid_pil = Image.fromarray(grid_np, mode='RGB')
+            
+            # Save grid image
+            sample_dir = output_dir / "samples"
+            sample_dir.mkdir(exist_ok=True)
+            grid_path = sample_dir / f"sampled_images_step_{step:06d}.png"
+            grid_pil.save(grid_path)
+            print(f"Saved sampled images grid to {grid_path}")
             
             # Log to wandb
             if cfg.wandb.enabled:
+                wandb_images = images_to_wandb(sampled_images, sampled_labels, num_samples)
                 eval_log_dict = {
                     "eval/train_loss": avg_train_loss,
                     "eval/test_loss": avg_test_loss,
@@ -376,6 +395,7 @@ def main(cfg: DictConfig):
                     "eval/best_test_loss": best_test_loss,
                     "eval/learning_rate": optimizer.param_groups[0]['lr'],
                     "eval/sampled_images": wandb_images,
+                    "eval/sampled_images_grid": wandb.Image(grid_pil, caption=f"Step {step}"),
                     "step": step,
                 }
                 wandb.log(eval_log_dict, step=step)
