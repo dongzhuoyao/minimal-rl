@@ -740,7 +740,7 @@ def main(cfg: DictConfig):
                         label = sample["label"].item()
                         reward = sample["reward"]
                         advantage = sample["advantages"].item()
-                        captions.append(f"L:{label} R:{reward:.2f} A:{advantage:.2f}")
+                        captions.append(f"L:{label} R:{reward:.4f} A:{advantage:.4f}")
                     
                     # Stack images and create grid
                     images_tensor = torch.cat(images_to_grid, dim=0)  # [N, 1, 28, 28]
