@@ -25,7 +25,7 @@ training:
   num_samples_per_label: 4
   num_steps: 20  # Number of flow matching steps per sample
   eval_num_steps: 20  # Number of flow matching steps for evaluation
-  lr: 1e-3
+  lr: 1e-4
   clip_range: 0.0001
   beta: 0.0
   eval_freq: 500  # Frequency of evaluation (in steps)
