@@ -15,7 +15,7 @@ model:
 # Training hyperparameters
 training:
   num_steps: 100000  # Total number of training steps
-  batch_size: 64
+  batch_size: 128
   lr: 1e-3
   max_grad_norm: 1.0
   eval_freq: 500  # Evaluate every N steps
