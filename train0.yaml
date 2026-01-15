@@ -1,5 +1,10 @@
 # Flow Matching training configuration
 
+# Hydra configuration for output directory structure
+hydra:
+  job:
+    name: train0  # This creates outputs0/train0/YYYY-MM-DD/HH-MM-SS/ structure
+
 # Run name for logging and outputs
 run_name: null
 

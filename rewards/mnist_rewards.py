@@ -13,6 +13,7 @@ import torchvision.transforms as transforms
 from torchvision.models import resnet18
 import numpy as np
 from typing import List, Dict, Optional, Tuple
+from pathlib import Path
 
 
 class MNISTClassifierReward:
@@ -32,9 +33,15 @@ class MNISTClassifierReward:
     - Doesn't penalize artifacts that don't affect classification
     """
     
-    def __init__(self, device='cuda', pretrained=True):
+    def __init__(self, device='cuda', pretrained=True, checkpoint_path=None):
+        """
+        Args:
+            device: Device to run on
+            pretrained: If True, try to load a checkpoint (default True)
+            checkpoint_path: Optional path to classifier checkpoint
+        """
         self.device = device
-        self.classifier = self._load_classifier(pretrained)
+        self.classifier = self._load_classifier(pretrained, checkpoint_path)
         self.classifier.eval()
         self.classifier.to(device)
         
@@ -46,16 +53,53 @@ class MNISTClassifierReward:
             transforms.Normalize((0.1307,), (0.3081,))  # MNIST normalization
         ])
     
-    def _load_classifier(self, pretrained=True):
-        """Load or create MNIST classifier."""
+    def _load_classifier(self, pretrained=True, checkpoint_path=None):
+        """Load or create MNIST classifier.
+        
+        Args:
+            pretrained: If True, try to load a checkpoint (default True)
+            checkpoint_path: Path to checkpoint file. If None, tries default paths.
+        """
+        model = self._create_simple_classifier()
+        
         if pretrained:
-            # Try to load a pre-trained classifier
-            # In practice, you'd train this on MNIST first
-            model = resnet18(num_classes=10)
-            # For now, we'll use a simple CNN
-            model = self._create_simple_classifier()
-        else:
-            model = self._create_simple_classifier()
+            # Try to load checkpoint from various locations
+            if checkpoint_path is None:
+                # Try common checkpoint locations
+                possible_paths = [
+                    'mnist_classifier.pt',
+                    'checkpoints/mnist_classifier.pt',
+                    'outputs/mnist_classifier.pt',
+                    Path(__file__).parent.parent / 'mnist_classifier.pt',
+                ]
+            else:
+                possible_paths = [checkpoint_path]
+            
+            loaded = False
+            for path in possible_paths:
+                path = Path(path)
+                if path.exists():
+                    try:
+                        print(f"Loading MNIST classifier from {path}...")
+                        checkpoint = torch.load(path, map_location=self.device)
+                        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                            model.load_state_dict(checkpoint['model_state_dict'])
+                            print(f"Loaded classifier (Test Acc: {checkpoint.get('test_acc', 'N/A'):.2f}%)")
+                        else:
+                            # Assume it's just the state dict
+                            model.load_state_dict(checkpoint)
+                            print("Loaded classifier state dict")
+                        loaded = True
+                        break
+                    except Exception as e:
+                        print(f"Warning: Failed to load checkpoint from {path}: {e}")
+                        continue
+            
+            if not loaded:
+                print("Warning: No pretrained classifier checkpoint found. Using untrained classifier.")
+                print("  Train a classifier first by running: python train_classifier.py")
+                print("  This will create 'mnist_classifier.pt' which will be automatically loaded.")
+        
         return model
     
     def _create_simple_classifier(self):
@@ -1600,6 +1644,357 @@ def get_recommended_reward_config(config_name: str = 'digit_zero', device: str =
             use_perceptual=False,
             use_diversity=True,
         ),
+        # Toy rewards for experimentation
+        'bright': MNISTBrightDigitReward(device=device),
+        'centered': MNISTCenteredDigitReward(device=device),
+        'sparse': MNISTSparseDigitReward(device=device),
+        'large': MNISTLargeDigitReward(device=device),
+        'contrast': MNISTHighContrastReward(device=device),
+        'tiny': MNISTTinyDigitReward(device=device),
     }
     
     return configs.get(config_name, configs['digit_zero'])
+
+
+# ============================================================================
+# TOY REWARDS - Fun experimental rewards for playing with FlowGRPO
+# ============================================================================
+
+class MNISTBrightDigitReward:
+    """
+    Toy reward: Rewards brighter/more visible digits.
+    
+    This reward encourages the model to generate digits that are bright and
+    clearly visible. Simple but effective for demonstrating reward shaping.
+    
+    Pros:
+    - Simple and interpretable
+    - Encourages clear, visible digits
+    - Fast computation
+    
+    Cons:
+    - Doesn't ensure correctness
+    - May favor overexposed images
+    
+    Usage:
+        reward_fn = MNISTBrightDigitReward(device='cuda')
+        rewards = reward_fn(images, prompts)
+    """
+    
+    def __init__(self, device='cuda', brightness_weight=1.0):
+        """
+        Args:
+            device: Device to run on
+            brightness_weight: Weight for brightness (default 1.0)
+        """
+        self.device = device
+        self.brightness_weight = brightness_weight
+    
+    def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
+        """Compute brightness-based rewards."""
+        # Preprocess
+        if images.dim() == 3:
+            images = images.unsqueeze(1)
+        if images.shape[1] == 3:
+            images = images.mean(dim=1, keepdim=True)
+        
+        # Normalize to [0, 1] if needed
+        if images.max() > 1.1:
+            images = images / 255.0
+        
+        # Compute mean brightness per image
+        brightness = images.view(images.shape[0], -1).mean(dim=1)  # [batch_size]
+        
+        # Reward: higher brightness = higher reward
+        rewards = brightness * self.brightness_weight
+        
+        return torch.clamp(rewards, 0.0, 1.0)
+
+
+class MNISTCenteredDigitReward:
+    """
+    Toy reward: Rewards digits that are centered in the image.
+    
+    This reward encourages digits to be positioned in the center of the image
+    by measuring pixel density in the center region vs edges.
+    
+    Pros:
+    - Encourages well-centered digits
+    - Simple geometric reward
+    - Good for demonstrating spatial rewards
+    
+    Cons:
+    - Doesn't ensure correctness
+    - May not work well if digits are naturally off-center
+    
+    Usage:
+        reward_fn = MNISTCenteredDigitReward(device='cuda')
+        rewards = reward_fn(images, prompts)
+    """
+    
+    def __init__(self, device='cuda', center_radius=0.3):
+        """
+        Args:
+            device: Device to run on
+            center_radius: Radius of center region (as fraction of image size, default 0.3)
+        """
+        self.device = device
+        self.center_radius = center_radius
+    
+    def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
+        """Compute centering-based rewards."""
+        # Preprocess
+        if images.dim() == 3:
+            images = images.unsqueeze(1)
+        if images.shape[1] == 3:
+            images = images.mean(dim=1, keepdim=True)
+        
+        # Normalize to [0, 1] if needed
+        if images.max() > 1.1:
+            images = images / 255.0
+        
+        batch_size = images.shape[0]
+        H, W = images.shape[2], images.shape[3]
+        
+        # Create center mask
+        center_y, center_x = H // 2, W // 2
+        y_coords = torch.arange(H, device=self.device).float() - center_y
+        x_coords = torch.arange(W, device=self.device).float() - center_x
+        Y, X = torch.meshgrid(y_coords, x_coords, indexing='ij')
+        distances = torch.sqrt(X**2 + Y**2)
+        max_dist = torch.sqrt(torch.tensor(H**2 + W**2, device=self.device).float()) / 2
+        center_mask = (distances < max_dist * self.center_radius).float()  # [H, W]
+        
+        # Compute pixel density in center vs edges
+        center_mask = center_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        edge_mask = 1.0 - center_mask
+        
+        center_density = (images * center_mask).view(batch_size, -1).sum(dim=1) / (center_mask.sum() + 1e-8)
+        edge_density = (images * edge_mask).view(batch_size, -1).sum(dim=1) / (edge_mask.sum() + 1e-8)
+        
+        # Reward: higher center density relative to edge density
+        rewards = center_density / (edge_density + center_density + 1e-8)
+        
+        return torch.clamp(rewards, 0.0, 1.0)
+
+
+class MNISTSparseDigitReward:
+    """
+    Toy reward: Rewards sparse digits (fewer pixels, thinner strokes).
+    
+    This reward encourages the model to generate digits with fewer active pixels,
+    resulting in thinner, more minimal digit representations.
+    
+    Pros:
+    - Encourages minimal, clean digits
+    - Demonstrates sparsity-based rewards
+    - Can create interesting artistic effects
+    
+    Cons:
+    - May make digits too thin to recognize
+    - Doesn't ensure correctness
+    
+    Usage:
+        reward_fn = MNISTSparseDigitReward(device='cuda', sparsity_target=0.1)
+        rewards = reward_fn(images, prompts)
+    """
+    
+    def __init__(self, device='cuda', sparsity_target=0.1, threshold=0.1):
+        """
+        Args:
+            device: Device to run on
+            sparsity_target: Target fraction of pixels that should be active (default 0.1 = 10%)
+            threshold: Pixel value threshold for "active" pixel (default 0.1)
+        """
+        self.device = device
+        self.sparsity_target = sparsity_target
+        self.threshold = threshold
+    
+    def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
+        """Compute sparsity-based rewards."""
+        # Preprocess
+        if images.dim() == 3:
+            images = images.unsqueeze(1)
+        if images.shape[1] == 3:
+            images = images.mean(dim=1, keepdim=True)
+        
+        # Normalize to [0, 1] if needed
+        if images.max() > 1.1:
+            images = images / 255.0
+        
+        # Count active pixels (above threshold)
+        active_pixels = (images > self.threshold).float()
+        sparsity = 1.0 - active_pixels.view(images.shape[0], -1).mean(dim=1)  # Fraction of inactive pixels
+        
+        # Reward: closer to target sparsity = higher reward
+        # Use negative distance from target
+        sparsity_diff = torch.abs(sparsity - self.sparsity_target)
+        rewards = 1.0 - sparsity_diff / self.sparsity_target  # Normalize by target
+        
+        return torch.clamp(rewards, 0.0, 1.0)
+
+
+class MNISTLargeDigitReward:
+    """
+    Toy reward: Rewards larger digits (more pixels, thicker strokes).
+    
+    Opposite of sparse reward - encourages digits that fill more of the image.
+    
+    Pros:
+    - Encourages bold, visible digits
+    - Good for demonstrating size-based rewards
+    
+    Cons:
+    - May make digits too large/thick
+    - Doesn't ensure correctness
+    
+    Usage:
+        reward_fn = MNISTLargeDigitReward(device='cuda')
+        rewards = reward_fn(images, prompts)
+    """
+    
+    def __init__(self, device='cuda', threshold=0.1):
+        """
+        Args:
+            device: Device to run on
+            threshold: Pixel value threshold for "active" pixel (default 0.1)
+        """
+        self.device = device
+        self.threshold = threshold
+    
+    def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
+        """Compute size-based rewards."""
+        # Preprocess
+        if images.dim() == 3:
+            images = images.unsqueeze(1)
+        if images.shape[1] == 3:
+            images = images.mean(dim=1, keepdim=True)
+        
+        # Normalize to [0, 1] if needed
+        if images.max() > 1.1:
+            images = images / 255.0
+        
+        # Compute fraction of active pixels
+        active_pixels = (images > self.threshold).float()
+        size_ratio = active_pixels.view(images.shape[0], -1).mean(dim=1)  # Fraction of active pixels
+        
+        # Reward: more pixels = higher reward
+        rewards = size_ratio
+        
+        return torch.clamp(rewards, 0.0, 1.0)
+
+
+class MNISTHighContrastReward:
+    """
+    Toy reward: Rewards high contrast images.
+    
+    Encourages images with strong contrast between foreground and background,
+    resulting in sharp, well-defined digits.
+    
+    Pros:
+    - Encourages clear, sharp digits
+    - Simple contrast metric
+    - Good for visual quality
+    
+    Cons:
+    - Doesn't ensure correctness
+    - May favor extreme contrast
+    
+    Usage:
+        reward_fn = MNISTHighContrastReward(device='cuda')
+        rewards = reward_fn(images, prompts)
+    """
+    
+    def __init__(self, device='cuda'):
+        """Args: device: Device to run on"""
+        self.device = device
+    
+    def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
+        """Compute contrast-based rewards."""
+        # Preprocess
+        if images.dim() == 3:
+            images = images.unsqueeze(1)
+        if images.shape[1] == 3:
+            images = images.mean(dim=1, keepdim=True)
+        
+        # Normalize to [0, 1] if needed
+        if images.max() > 1.1:
+            images = images / 255.0
+        
+        # Compute standard deviation (measure of contrast)
+        contrast = images.view(images.shape[0], -1).std(dim=1)  # [batch_size]
+        
+        # Normalize: std can be at most ~0.5 for binary images
+        rewards = contrast / 0.5
+        
+        return torch.clamp(rewards, 0.0, 1.0)
+
+
+class MNISTTinyDigitReward:
+    """
+    Toy reward: Rewards tiny digits (small bounding box).
+    
+    Encourages digits that occupy a small area in the image, creating
+    minimalist, compact digit representations.
+    
+    Pros:
+    - Creates interesting compact digits
+    - Demonstrates bounding box-based rewards
+    
+    Cons:
+    - May make digits too small to recognize
+    - Doesn't ensure correctness
+    
+    Usage:
+        reward_fn = MNISTTinyDigitReward(device='cuda')
+        rewards = reward_fn(images, prompts)
+    """
+    
+    def __init__(self, device='cuda', threshold=0.1):
+        """
+        Args:
+            device: Device to run on
+            threshold: Pixel value threshold for "active" pixel (default 0.1)
+        """
+        self.device = device
+        self.threshold = threshold
+    
+    def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
+        """Compute size-based rewards (smaller = better)."""
+        # Preprocess
+        if images.dim() == 3:
+            images = images.unsqueeze(1)
+        if images.shape[1] == 3:
+            images = images.mean(dim=1, keepdim=True)
+        
+        # Normalize to [0, 1] if needed
+        if images.max() > 1.1:
+            images = images / 255.0
+        
+        batch_size = images.shape[0]
+        H, W = images.shape[2], images.shape[3]
+        
+        # Find bounding box for each image
+        rewards = []
+        for i in range(batch_size):
+            img = images[i, 0]  # [H, W]
+            active_mask = (img > self.threshold).float()
+            
+            # Find bounding box
+            active_y, active_x = torch.where(active_mask > 0)
+            if len(active_y) > 0:
+                min_y, max_y = active_y.min().item(), active_y.max().item()
+                min_x, max_x = active_x.min().item(), active_x.max().item()
+                bbox_area = (max_y - min_y + 1) * (max_x - min_x + 1)
+                image_area = H * W
+                size_ratio = bbox_area / image_area
+                
+                # Reward: smaller bounding box = higher reward
+                reward = 1.0 - size_ratio
+            else:
+                reward = 0.0
+            
+            rewards.append(reward)
+        
+        rewards = torch.tensor(rewards, device=self.device)
+        return torch.clamp(rewards, 0.0, 1.0)

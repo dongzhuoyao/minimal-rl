@@ -42,11 +42,13 @@ def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
     print("=" * 60)
     
+    # Get Hydra's output directory (always available)
+    # This will use Hydra's configured output directory (e.g., "outputs0/train0/YYYY-MM-DD/HH-MM-SS/")
+    hydra_cfg = HydraConfig.get()
+    hydra_output_dir = Path(hydra_cfg.run.dir)
+    
     # Initialize wandb
     if cfg.wandb.enabled:
-        # Get Hydra's output directory using HydraConfig
-        hydra_cfg = HydraConfig.get()
-        hydra_output_dir = Path(hydra_cfg.run.dir)
         wandb_dir = hydra_output_dir / "wandb"
         
         # Set WANDB_DIR environment variable to ensure wandb uses this directory
@@ -79,9 +81,15 @@ def main(cfg: DictConfig):
     print(f"Using device: {device}")
     device = torch.device(device)
     
-    # Create output directory
-    output_dir = Path(cfg.paths.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Create checkpoint and sample directories within Hydra output directory
+    # The script identifier (train0) is now in the Hydra output directory structure
+    checkpoint_dir = hydra_output_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    sample_dir = hydra_output_dir / "samples"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"Checkpoints will be saved to: {checkpoint_dir}")
+    print(f"Samples will be saved to: {sample_dir}")
     
     # Load MNIST datasets
     print("Loading MNIST datasets...")
@@ -379,8 +387,6 @@ def main(cfg: DictConfig):
             grid_pil = Image.fromarray(grid_np, mode='RGB')
             
             # Save grid image
-            sample_dir = output_dir / "samples"
-            sample_dir.mkdir(exist_ok=True)
             grid_path = sample_dir / f"sampled_images_step_{step:06d}.png"
             grid_pil.save(grid_path)
             print(f"Saved sampled images grid to {grid_path}")
@@ -409,8 +415,9 @@ def main(cfg: DictConfig):
                     'optimizer_state_dict': optimizer.state_dict(),
                     'test_loss': avg_test_loss,
                 }
-                torch.save(checkpoint, output_dir / 'best_model.pt')
-                print(f"Saved best model (test loss: {avg_test_loss:.6f})")
+                checkpoint_path = checkpoint_dir / 'best_model.pt'
+                torch.save(checkpoint, checkpoint_path)
+                print(f"Saved best model (test loss: {avg_test_loss:.6f}) to {checkpoint_path}")
                 
                 # Log best test loss to wandb
                 if cfg.wandb.enabled:
@@ -424,7 +431,8 @@ def main(cfg: DictConfig):
     pbar.close()
     
     print(f"\nTraining complete! Best test loss: {best_test_loss:.6f}")
-    print(f"Checkpoints saved in {output_dir}")
+    print(f"Checkpoints saved in {checkpoint_dir}")
+    print(f"Samples saved in {sample_dir}")
     
     # Finish wandb run
     if cfg.wandb.enabled:

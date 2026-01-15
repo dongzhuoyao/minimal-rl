@@ -285,7 +285,7 @@ def main(cfg: DictConfig):
     
     # Initialize reward function
     print("Initializing reward function...")
-    reward_config = cfg.get("reward", {}).get("config", "digit_zero")
+    reward_config = cfg.get("reward", {}).get("config", "large")
     reward_fn = get_recommended_reward_config(reward_config, device=device)
     
     # Initialize stat tracker for advantages

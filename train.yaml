@@ -1,5 +1,10 @@
 # Single Hydra config file for FlowGRPO tutorial
 
+# Hydra configuration for output directory structure
+hydra:
+  job:
+    name: train  # This creates outputs0/train/YYYY-MM-DD/HH-MM-SS/ structure
+
 # Run name for logging and outputs
 run_name: "flowgrpo"
 
@@ -29,12 +34,12 @@ training:
   save_freq: 1000  # Frequency of checkpoint saving (in steps)
 
 # Checkpoint configuration
-pretrained_checkpoint: "best_model.pt"  # Path to pretrained checkpoint
+pretrained_checkpoint: "./outputs/flow_matching/best_model.pt"  # Path to pretrained checkpoint
 resume_from: null  # Path to checkpoint to resume training from (loads optimizer state too)
 
 # Reward configuration
 reward:
-  config: "digit_zero"  # Reward config: 'digit_zero' (default, generates only 0), 'accuracy', 'quality', 'balanced', 'diverse'
+  config: "large"  # Reward config: 'large' (default, rewards large/bold digits), 'digit_zero', 'accuracy', 'quality', 'balanced', 'diverse', 'bright', 'centered', 'sparse', 'contrast', 'tiny'
 
 # Dataset configuration
 dataset:
