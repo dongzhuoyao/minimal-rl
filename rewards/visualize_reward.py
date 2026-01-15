@@ -1,5 +1,5 @@
 """
-Visualize the shape reward function and target patterns.
+Visualize MNIST reward functions and examples.
 """
 import torch
 import matplotlib.pyplot as plt
@@ -8,152 +8,135 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from rewards.mnist_rewards import compute_shape_reward
+from rewards.mnist_rewards import MNISTLargeDigitReward
 
-def visualize_target_patterns():
-    """Visualize the target patterns for each shape type."""
-    signal_dim = 64
+def visualize_large_reward():
+    """Visualize the 'large' reward function with high and low reward examples."""
     device = "cpu"
+    reward_fn = MNISTLargeDigitReward(device=device, threshold=0.1)
     
-    # Create x coordinates
-    x = torch.linspace(0, 1, signal_dim, device=device)
+    # Create example images (28x28 MNIST size)
+    H, W = 28, 28
     
-    # Create target patterns
-    shapes = ["circle", "square", "triangle"]
-    targets = {}
+    # High reward examples: Large, bold digits with many active pixels
+    examples = []
     
-    for shape_type in shapes:
-        if shape_type == "circle":
-            target = 1.0 - 4 * (x - 0.5) ** 2
-            target = torch.clamp(target, 0, 1)
-        elif shape_type == "square":
-            target = ((x > 0.33) & (x < 0.67)).float()
-        elif shape_type == "triangle":
-            target = torch.where(x < 0.5, 2 * x, 2 * (1 - x))
-        targets[shape_type] = target
+    # 1. Very large digit (fills most of image) - HIGH REWARD
+    large_digit = torch.zeros(1, 1, H, W)
+    # Create a large filled circle/digit shape
+    center_y, center_x = H // 2, W // 2
+    radius = 12
+    y_coords = torch.arange(H, dtype=torch.float32).unsqueeze(1) - center_y
+    x_coords = torch.arange(W, dtype=torch.float32).unsqueeze(0) - center_x
+    distances = torch.sqrt(y_coords**2 + x_coords**2)
+    large_digit[0, 0] = (distances < radius).float() * 0.9
+    examples.append(("Very Large Digit\n(Fills ~60% of image)", large_digit, "HIGH"))
     
-    # Plot
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    # 2. Bold thick digit - HIGH REWARD
+    bold_digit = torch.zeros(1, 1, H, W)
+    # Create a thick vertical bar
+    bold_digit[0, 0, 4:24, 10:18] = 0.9
+    examples.append(("Bold Thick Digit\n(Thick strokes)", bold_digit, "HIGH"))
     
-    for idx, shape_type in enumerate(shapes):
-        target = targets[shape_type]
-        axes[idx].plot(x.numpy(), target.numpy(), 'b-', linewidth=3, label='Target')
-        axes[idx].set_title(f'{shape_type.capitalize()} Pattern', fontsize=14, fontweight='bold')
-        axes[idx].set_xlabel('Position (normalized)', fontsize=12)
-        axes[idx].set_ylabel('Value', fontsize=12)
-        axes[idx].grid(True, alpha=0.3)
-        axes[idx].set_ylim(-0.1, 1.1)
-        axes[idx].legend()
+    # 3. Medium-sized digit - MEDIUM REWARD
+    medium_digit = torch.zeros(1, 1, H, W)
+    radius = 8
+    distances = torch.sqrt(y_coords**2 + x_coords**2)
+    medium_digit[0, 0] = (distances < radius).float() * 0.9
+    examples.append(("Medium Digit\n(Fills ~30% of image)", medium_digit, "MEDIUM"))
     
-    plt.suptitle('Target Patterns for Shape Rewards', fontsize=16, fontweight='bold')
-    plt.tight_layout()
+    # 4. Small sparse digit - LOW REWARD
+    small_digit = torch.zeros(1, 1, H, W)
+    radius = 5
+    distances = torch.sqrt(y_coords**2 + x_coords**2)
+    small_digit[0, 0] = (distances < radius).float() * 0.9
+    examples.append(("Small Digit\n(Fills ~10% of image)", small_digit, "LOW"))
     
-    output_dir = Path("outputs")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_dir / "target_patterns.png", dpi=150, bbox_inches='tight')
-    print(f"Saved target patterns to {output_dir / 'target_patterns.png'}")
+    # 5. Very thin digit - LOW REWARD
+    thin_digit = torch.zeros(1, 1, H, W)
+    # Create a thin vertical line
+    thin_digit[0, 0, 6:22, 13:15] = 0.9
+    examples.append(("Thin Digit\n(Very sparse)", thin_digit, "LOW"))
     
-    return targets
-
-def visualize_reward_computation():
-    """Show how rewards are computed for different signals."""
-    signal_dim = 64
-    device = "cpu"
+    # 6. Almost empty - VERY LOW REWARD
+    empty_digit = torch.zeros(1, 1, H, W)
+    # Just a few pixels
+    empty_digit[0, 0, 14, 14] = 0.9
+    empty_digit[0, 0, 13, 14] = 0.9
+    empty_digit[0, 0, 15, 14] = 0.9
+    examples.append(("Almost Empty\n(Very few pixels)", empty_digit, "VERY LOW"))
     
-    # Create target patterns
-    x = torch.linspace(0, 1, signal_dim, device=device)
+    # Compute rewards for all examples
+    all_images = torch.cat([ex[1] for ex in examples], dim=0)
+    prompts = ["digit 0"] * len(examples)
+    rewards = reward_fn(all_images, prompts)
     
-    circle_target = torch.clamp(1.0 - 4 * (x - 0.5) ** 2, 0, 1)
-    square_target = ((x > 0.33) & (x < 0.67)).float()
-    triangle_target = torch.where(x < 0.5, 2 * x, 2 * (1 - x))
-    
-    # Create example signals
-    # 1. Perfect match
-    perfect_circle = circle_target.clone()
-    
-    # 2. Close match (with some noise)
-    noisy_circle = circle_target + 0.1 * torch.randn(signal_dim)
-    noisy_circle = (noisy_circle - noisy_circle.min()) / (noisy_circle.max() - noisy_circle.min() + 1e-8)
-    
-    # 3. Wrong shape (square instead of circle)
-    wrong_shape = square_target.clone()
-    
-    # 4. Random signal
-    random_signal = torch.rand(signal_dim)
-    
-    signals = {
-        "Perfect Circle": perfect_circle,
-        "Noisy Circle": noisy_circle,
-        "Wrong Shape (Square)": wrong_shape,
-        "Random Signal": random_signal,
-    }
-    
-    # Compute rewards
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    # Create visualization
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     axes = axes.flatten()
     
-    for idx, (name, signal) in enumerate(signals.items()):
-        # Normalize signal
-        signal_norm = (signal - signal.min()) / (signal.max() - signal.min() + 1e-8)
+    for idx, ((name, img, category), reward_val) in enumerate(zip(examples, rewards)):
+        ax = axes[idx]
         
-        # Compute rewards for each shape
-        circle_reward = compute_shape_reward(signal_norm.unsqueeze(0), "circle").item()
-        square_reward = compute_shape_reward(signal_norm.unsqueeze(0), "square").item()
-        triangle_reward = compute_shape_reward(signal_norm.unsqueeze(0), "triangle").item()
+        # Display image
+        img_np = img[0, 0].numpy()
+        im = ax.imshow(img_np, cmap='gray', vmin=0, vmax=1)
         
-        # Plot signal
-        axes[idx].plot(x.numpy(), signal_norm.numpy(), 'r-', linewidth=2, label='Signal', alpha=0.7)
-        axes[idx].plot(x.numpy(), circle_target.numpy(), 'b--', linewidth=1.5, label='Circle target', alpha=0.5)
-        axes[idx].plot(x.numpy(), square_target.numpy(), 'g--', linewidth=1.5, label='Square target', alpha=0.5)
-        axes[idx].plot(x.numpy(), triangle_target.numpy(), 'm--', linewidth=1.5, label='Triangle target', alpha=0.5)
+        # Calculate active pixel ratio for display
+        active_ratio = (img_np > 0.1).sum() / (H * W)
         
-        axes[idx].set_title(f'{name}\nRewards: Circle={circle_reward:.3f}, Square={square_reward:.3f}, Triangle={triangle_reward:.3f}', 
-                           fontsize=11, fontweight='bold')
-        axes[idx].set_xlabel('Position (normalized)', fontsize=10)
-        axes[idx].set_ylabel('Value', fontsize=10)
-        axes[idx].grid(True, alpha=0.3)
-        axes[idx].legend(fontsize=8)
-        axes[idx].set_ylim(-0.1, 1.1)
+        # Color code based on reward
+        if reward_val > 0.5:
+            color = 'green'
+        elif reward_val > 0.2:
+            color = 'orange'
+        else:
+            color = 'red'
+        
+        # Title with reward info
+        title = f"{name}\nReward: {reward_val:.3f} | Active Pixels: {active_ratio:.1%}"
+        ax.set_title(title, fontsize=11, fontweight='bold', color=color)
+        ax.set_xlabel('Width (pixels)', fontsize=9)
+        ax.set_ylabel('Height (pixels)', fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        
+        # Add border with reward-based color
+        for spine in ax.spines.values():
+            spine.set_edgecolor(color)
+            spine.set_linewidth(3)
     
-    plt.suptitle('Reward Computation Examples', fontsize=16, fontweight='bold')
+    plt.suptitle('MNIST Large Digit Reward Visualization\n(Higher reward = More active pixels)', 
+                 fontsize=16, fontweight='bold')
     plt.tight_layout()
     
     output_dir = Path("outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_dir / "reward_examples.png", dpi=150, bbox_inches='tight')
-    print(f"Saved reward examples to {output_dir / 'reward_examples.png'}")
-
-def show_reward_formula():
-    """Show the mathematical formula for reward computation."""
+    plt.savefig(output_dir / "large_reward_visualization.png", dpi=150, bbox_inches='tight')
+    print(f"Saved large reward visualization to {output_dir / 'large_reward_visualization.png'}")
+    
+    # Print summary
     print("\n" + "="*60)
-    print("SHAPE REWARD COMPUTATION")
+    print("LARGE REWARD SUMMARY")
     print("="*60)
-    print("\n1. Normalize signal to [0, 1]:")
-    print("   signal_norm = (signal - min(signal)) / (max(signal) - min(signal))")
-    print("\n2. Create target pattern based on shape type:")
-    print("   Circle:   target = clamp(1.0 - 4 * (x - 0.5)², 0, 1)")
-    print("   Square:   target = 1 if 0.33 < x < 0.67, else 0")
-    print("   Triangle: target = 2*x if x < 0.5, else 2*(1-x)")
-    print("\n3. Compute Mean Squared Error (MSE):")
-    print("   MSE = mean((signal_norm - target)²)")
-    print("\n4. Convert MSE to reward:")
-    print("   reward = 1.0 - MSE")
-    print("\n   → Higher reward (closer to 1.0) = better match")
-    print("   → Lower reward (closer to 0.0) = worse match")
+    print("\nReward Formula:")
+    print("  1. Count pixels above threshold (default: 0.1)")
+    print("  2. Compute fraction: active_pixels / total_pixels")
+    print("  3. Reward = fraction (clamped to [0, 1])")
+    print("\nExamples:")
+    for (name, _, category), reward_val in zip(examples, rewards):
+        active_ratio = (examples[examples.index((name, _, category))][1][0, 0] > 0.1).sum().item() / (H * W)
+        print(f"  {name:30s} | Reward: {reward_val:.3f} | Active: {active_ratio:.1%}")
     print("="*60 + "\n")
+    
+    return examples, rewards
+
 
 if __name__ == "__main__":
-    print("Visualizing shape reward function...")
+    print("Visualizing MNIST reward functions...")
     
-    # Show formula
-    show_reward_formula()
-    
-    # Visualize target patterns
-    print("Creating target patterns visualization...")
-    visualize_target_patterns()
-    
-    # Visualize reward computation
-    print("Creating reward computation examples...")
-    visualize_reward_computation()
+    # Visualize large reward
+    print("\nCreating large reward visualization...")
+    visualize_large_reward()
     
     print("\nDone! Check outputs/ for visualizations.")
