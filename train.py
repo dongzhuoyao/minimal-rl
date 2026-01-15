@@ -244,7 +244,7 @@ def sample_with_logprob(model, labels, num_steps, device, return_trajectory=Fals
         enable_grad: If True, enable gradients (for training phase sampling)
     
     Returns:
-        final_images: [B, 1, 28, 28] final generated images
+        final_images: [B, 1, 28, 28] final generated images in [0, 1] range
         trajectory: List of [B, signal_dim] tensors (if return_trajectory=True)
         log_probs: [B, num_steps] log probabilities for each step
         timesteps: [B, num_steps] time values for each step
@@ -293,8 +293,14 @@ def sample_with_logprob(model, labels, num_steps, device, return_trajectory=Fals
     log_probs = torch.stack(log_probs, dim=1)  # [B, num_steps]
     timesteps = torch.cat(timesteps, dim=1)  # [B, num_steps]
     
-    # Reshape final images to [B, 1, 28, 28] for reward computation
+    # Reshape final images to [B, 1, 28, 28]
     final_images = x.view(B, 1, 28, 28)
+    
+    # Normalize to [-1, 1] range (standard for flow matching models)
+    # Then convert to [0, 1] range expected by reward functions
+    final_images = torch.tanh(final_images)  # Normalize to [-1, 1]
+    final_images = (final_images + 1.0) / 2.0  # Convert [-1, 1] -> [0, 1]
+    final_images = torch.clamp(final_images, 0.0, 1.0)  # Ensure valid range
     
     if return_trajectory:
         return final_images, trajectory, log_probs, timesteps
@@ -498,9 +504,8 @@ def main(cfg: DictConfig):
             )
         
         # Compute rewards
-        # Convert images to format expected by reward function: [B, 1, 28, 28] -> [B, 1, 28, 28]
-        # Reward function expects images in [0, 1] range
-        images_for_reward = torch.clamp(final_images, 0.0, 1.0)
+        # Images from sample_with_logprob are already in [0, 1] range
+        images_for_reward = final_images
         
         # Create prompt strings for reward function
         reward_prompts = [f"digit {label.item()}" for label in expanded_labels]
@@ -761,7 +766,7 @@ def main(cfg: DictConfig):
                                 num_steps=cfg.training.eval_num_steps,
                                 device=device,
                             )
-                            test_images = torch.clamp(test_images, 0.0, 1.0)
+                            # Images are already in [0, 1] range from sample_with_logprob
                             
                             # Create grid of evaluation images
                             eval_grid = make_grid(test_images, nrow=4, normalize=False, pad_value=1.0)
