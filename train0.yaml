@@ -31,10 +31,6 @@ training:
 dataset:
   dataset_dir: "dataset"
 
-# Output paths
-paths:
-  output_dir: "outputs/flow_matching"
-
 # Wandb configuration
 wandb:
   enabled: true
