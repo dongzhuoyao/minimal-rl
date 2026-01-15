@@ -431,8 +431,16 @@ def load_pretrained_checkpoint(model, checkpoint_path, device, strict=False):
     if unexpected_keys:
         print(f"WARNING: Unexpected keys in checkpoint (will be ignored): {unexpected_keys}")
     
+    # Store a sample weight before loading to verify it changes
+    sample_param_name = next(iter(model_state_dict.keys()))
+    weight_before = model_state_dict[sample_param_name].clone()
+    
     # Load state dict with strict parameter
     load_result = model.load_state_dict(checkpoint_state_dict, strict=strict)
+    
+    # Verify that weights actually changed
+    weight_after = model.state_dict()[sample_param_name]
+    weights_changed = not torch.equal(weight_before, weight_after)
     
     if load_result.missing_keys:
         print(f"WARNING: Some model parameters were not loaded: {load_result.missing_keys}")
@@ -446,6 +454,15 @@ def load_pretrained_checkpoint(model, checkpoint_path, device, strict=False):
         print("✓ Checkpoint loaded successfully! (Some unexpected keys were ignored)")
     else:
         print(f"⚠ Checkpoint loaded with warnings: {len(missing_keys)} missing keys, {len(unexpected_keys)} unexpected keys")
+    
+    # Verify weights were actually updated
+    if weights_changed:
+        print(f"✓ Model weights updated successfully (verified: {sample_param_name} changed)")
+    else:
+        print(f"⚠ WARNING: Model weights may not have changed! Check if checkpoint matches model architecture.")
+        print(f"  Sample param '{sample_param_name}' shape: {weight_before.shape}")
+        print(f"  Before: mean={weight_before.mean().item():.6f}, std={weight_before.std().item():.6f}")
+        print(f"  After:  mean={weight_after.mean().item():.6f}, std={weight_after.std().item():.6f}")
     
     # Print checkpoint info
     if 'step' in checkpoint:

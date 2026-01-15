@@ -83,6 +83,7 @@ def main(cfg: DictConfig):
     
     # Create checkpoint and sample directories within Hydra output directory
     # The script identifier (train0) is now in the Hydra output directory structure
+    # Save checkpoints in checkpoints subdirectory: outputs0/train0/YYYY-MM-DD/HH-MM-SS/checkpoints/
     checkpoint_dir = hydra_output_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     sample_dir = hydra_output_dir / "samples"
@@ -415,7 +416,8 @@ def main(cfg: DictConfig):
                     'optimizer_state_dict': optimizer.state_dict(),
                     'test_loss': avg_test_loss,
                 }
-                checkpoint_path = checkpoint_dir / 'best_model.pt'
+                # Save checkpoint in checkpoints subdirectory with format: iter_xxxx.pt
+                checkpoint_path = checkpoint_dir / f'iter_{step:06d}.pt'
                 torch.save(checkpoint, checkpoint_path)
                 print(f"Saved best model (test loss: {avg_test_loss:.6f}) to {checkpoint_path}")
                 
