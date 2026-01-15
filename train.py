@@ -125,7 +125,7 @@ import copy
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dataset import MNISTDataset
-from model import create_mnist_model
+from model import SimpleUNet
 from rewards.mnist_rewards import get_recommended_reward_config
 
 
@@ -252,9 +252,10 @@ def sample_with_logprob(model, labels, num_steps, device, return_trajectory=Fals
     if not enable_grad:
         model.eval()
     B = labels.shape[0]
-    signal_dim = model.signal_dim
+    signal_dim = 784  # MNIST: 28x28 = 784
+    img_size = 28
     
-    # Initialize with noise
+    # Initialize with noise (flattened)
     x = torch.randn(B, signal_dim, device=device)
     
     trajectory = [x.clone()] if return_trajectory else None
@@ -265,11 +266,27 @@ def sample_with_logprob(model, labels, num_steps, device, return_trajectory=Fals
     dt = 1.0 / num_steps
     t = torch.zeros(B, 1, device=device)
     
+    # Karras schedule parameters (matching model.py)
+    sigma_min, sigma_max = 0.002, 80.0
+    rho = 7.0
+    min_inv_rho = sigma_min ** (1 / rho)
+    max_inv_rho = sigma_max ** (1 / rho)
+    
     context = torch.enable_grad() if enable_grad else torch.no_grad()
     with context:
         for step in range(num_steps):
-            # Compute velocity
-            v = model(x, t, labels)
+            # Reshape x to image format [B, 1, 28, 28]
+            x_img = x.view(B, 1, img_size, img_size)
+            
+            # Convert time t to sigma using Karras schedule
+            t_flat = t.squeeze(-1) if t.dim() > 1 else t  # [B]
+            sigma = (max_inv_rho + t_flat * (min_inv_rho - max_inv_rho)) ** rho  # [B]
+            
+            # Compute velocity using SimpleUNet
+            v_img = model(x_img, sigma, labels)  # [B, 1, 28, 28]
+            
+            # Reshape velocity back to flattened format
+            v = v_img.view(B, signal_dim)  # [B, signal_dim]
             
             # Compute log probability for this step
             # For flow matching: log p ≈ -0.5 * ||v||^2 * dt
@@ -294,7 +311,7 @@ def sample_with_logprob(model, labels, num_steps, device, return_trajectory=Fals
     timesteps = torch.cat(timesteps, dim=1)  # [B, num_steps]
     
     # Reshape final images to [B, 1, 28, 28]
-    final_images = x.view(B, 1, 28, 28)
+    final_images = x.view(B, 1, img_size, img_size)
     
     # Normalize to [-1, 1] range (standard for flow matching models)
     # Then convert to [0, 1] range expected by reward functions
@@ -317,15 +334,15 @@ def compute_log_prob_at_timestep(model, x_t, t, labels, x_next, dt):
     
         log p(x_{t+1} | x_t) ≈ -0.5 * ||v_pred||² * dt
     
-    where v_pred = model(x_t, t, labels) is the predicted velocity.
+    where v_pred = model(x_t_img, sigma, labels) is the predicted velocity.
     
     This function is called for each timestep in the trajectory during training
     to compute log p_new, which is then compared to log p_old (from sampling)
     to compute the importance ratio.
     
     Args:
-        model: Flow matching model (predicts velocity field)
-        x_t: [B, signal_dim] current state at timestep t
+        model: SimpleUNet model (predicts velocity field)
+        x_t: [B, signal_dim] current state at timestep t (flattened)
         t: [B, 1] current time value in [0, 1]
         labels: [B] class labels (0-9 for MNIST)
         x_next: [B, signal_dim] next state (from stored trajectory)
@@ -334,8 +351,26 @@ def compute_log_prob_at_timestep(model, x_t, t, labels, x_next, dt):
     Returns:
         log_prob: [B] log probabilities for each sample in batch
     """
-    # Predict velocity
-    v_pred = model(x_t, t, labels)
+    B = x_t.shape[0]
+    signal_dim = x_t.shape[1]
+    img_size = int(signal_dim ** 0.5)  # Assume square images
+    
+    # Reshape x_t to image format [B, 1, 28, 28]
+    x_t_img = x_t.view(B, 1, img_size, img_size)
+    
+    # Convert time t to sigma using Karras schedule
+    t_flat = t.squeeze(-1) if t.dim() > 1 else t  # [B]
+    sigma_min, sigma_max = 0.002, 80.0
+    rho = 7.0
+    min_inv_rho = sigma_min ** (1 / rho)
+    max_inv_rho = sigma_max ** (1 / rho)
+    sigma = (max_inv_rho + t_flat * (min_inv_rho - max_inv_rho)) ** rho  # [B]
+    
+    # Predict velocity using SimpleUNet
+    v_pred_img = model(x_t_img, sigma, labels)  # [B, 1, 28, 28]
+    
+    # Reshape velocity back to flattened format
+    v_pred = v_pred_img.view(B, signal_dim)  # [B, signal_dim]
     
     # Compute log probability: -0.5 * ||v_pred||^2 * dt
     # Clip v_pred^2 to prevent overflow
@@ -346,6 +381,83 @@ def compute_log_prob_at_timestep(model, x_t, t, labels, x_next, dt):
     log_prob = torch.clamp(log_prob, min=-100.0, max=100.0)
     
     return log_prob
+
+
+def load_pretrained_checkpoint(model, checkpoint_path, device, strict=False):
+    """
+    Load a pretrained checkpoint into a model with comprehensive verification.
+    
+    This function handles checkpoint loading with proper error handling and
+    verification. It checks for:
+    - File existence
+    - Checkpoint structure (must contain 'model_state_dict')
+    - Key mismatches (missing/unexpected keys)
+    - Parameter count verification
+    
+    Args:
+        model: PyTorch model to load checkpoint into
+        checkpoint_path: Path to the checkpoint file (.pt or .pth)
+        device: Device to load checkpoint on ('cpu' or 'cuda')
+        strict: If True, require exact key match. If False, allow partial loading.
+                Default: False (allows partial loading with warnings)
+    
+    Returns:
+        checkpoint: Dictionary containing the loaded checkpoint (includes 'model_state_dict',
+                   'optimizer_state_dict', 'step', etc.)
+    
+    Raises:
+        FileNotFoundError: If checkpoint file doesn't exist
+        KeyError: If checkpoint is missing 'model_state_dict' key
+    """
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Pretrained checkpoint not found: {checkpoint_path}")
+    
+    print(f"Loading pretrained checkpoint from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Verify checkpoint structure
+    if 'model_state_dict' not in checkpoint:
+        raise KeyError(f"Checkpoint missing 'model_state_dict' key. Available keys: {list(checkpoint.keys())}")
+    
+    # Get model and checkpoint state dicts
+    model_state_dict = model.state_dict()
+    checkpoint_state_dict = checkpoint['model_state_dict']
+    
+    # Check for missing and unexpected keys
+    model_keys = set(model_state_dict.keys())
+    checkpoint_keys = set(checkpoint_state_dict.keys())
+    
+    missing_keys = model_keys - checkpoint_keys
+    unexpected_keys = checkpoint_keys - model_keys
+    
+    if missing_keys:
+        print(f"WARNING: Missing keys in checkpoint: {missing_keys}")
+    if unexpected_keys:
+        print(f"WARNING: Unexpected keys in checkpoint (will be ignored): {unexpected_keys}")
+    
+    # Load state dict with strict parameter
+    load_result = model.load_state_dict(checkpoint_state_dict, strict=strict)
+    
+    if load_result.missing_keys:
+        print(f"WARNING: Some model parameters were not loaded: {load_result.missing_keys}")
+    if load_result.unexpected_keys:
+        print(f"WARNING: Some checkpoint parameters were not used: {load_result.unexpected_keys}")
+    
+    # Verify loading by checking a few parameter values
+    if not missing_keys and not unexpected_keys:
+        print("✓ Checkpoint loaded successfully! All keys matched.")
+    elif not missing_keys:
+        print("✓ Checkpoint loaded successfully! (Some unexpected keys were ignored)")
+    else:
+        print(f"⚠ Checkpoint loaded with warnings: {len(missing_keys)} missing keys, {len(unexpected_keys)} unexpected keys")
+    
+    # Print checkpoint info
+    if 'step' in checkpoint:
+        print(f"  Checkpoint step: {checkpoint['step']}")
+    print(f"  Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"  Checkpoint parameters: {sum(p.numel() for p in checkpoint_state_dict.values()):,}")
+    
+    return checkpoint
 
 
 @hydra.main(version_base=None, config_path=".", config_name="train")
@@ -426,20 +538,21 @@ def main(cfg: DictConfig):
     
     # Create model
     print("Creating flow matching model...")
-    model = create_mnist_model(
-        signal_dim=cfg.model.signal_dim,
+    model = SimpleUNet(
+        img_channels=1,  # MNIST is grayscale
+        label_dim=cfg.model.vocab_size,  # 10 classes (digits 0-9)
         time_emb_dim=cfg.model.get("time_emb_dim", 40),
-        vocab_size=cfg.model.vocab_size,
     )
     model.to(device)
+    signal_dim = cfg.model.signal_dim  # Store signal_dim for use in functions
     
     # Load pretrained checkpoint
-    checkpoint_path = cfg.pretrained_checkpoint
-    assert os.path.exists(checkpoint_path)
-    print(f"Loading pretrained checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    print("Checkpoint loaded successfully!")
+    checkpoint = load_pretrained_checkpoint(
+        model=model,
+        checkpoint_path=cfg.pretrained_checkpoint,
+        device=device,
+        strict=False,  # Allow partial loading with warnings
+    )
     
     
     # Setup optimizer
