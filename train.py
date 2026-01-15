@@ -996,7 +996,25 @@ def main(cfg: DictConfig):
                     captions = []
                     for i in range(num_images_to_log):
                         sample = batch_samples[i]
-                        img = sample["image"].cpu()  # [1, 28, 28]
+                        img = sample["image"].cpu()  # Should be [1, 28, 28]
+                        
+                        # Ensure proper shape: [1, 28, 28]
+                        if img.dim() == 2:
+                            # [28, 28] -> [1, 28, 28]
+                            img = img.unsqueeze(0)
+                        elif img.dim() == 3:
+                            if img.shape[0] != 1:
+                                # If shape is [28, 28, 1] or similar, fix it
+                                if img.shape[2] == 1:
+                                    img = img.permute(2, 0, 1)  # [28, 28, 1] -> [1, 28, 28]
+                                elif img.shape[0] == 28 and img.shape[1] == 28:
+                                    img = img.unsqueeze(0)  # [28, 28] -> [1, 28, 28]
+                        
+                        # Final validation
+                        if img.dim() != 3 or img.shape[0] != 1:
+                            print(f"Warning: Cannot fix image {i} shape {img.shape}, skipping")
+                            continue
+                        
                         images_to_grid.append(img)
                         
                         label = sample["label"].item()
@@ -1004,11 +1022,17 @@ def main(cfg: DictConfig):
                         advantage = sample["advantages"].item()
                         captions.append(f"L:{label} R:{reward:.4f} A:{advantage:.4f}")
                     
+                    if len(images_to_grid) == 0:
+                        continue
+                    
                     # Stack images and create grid
                     images_tensor = torch.cat(images_to_grid, dim=0)  # [N, 1, 28, 28]
                     
-                    # Ensure proper shape
-                    if images_tensor.dim() != 4 or images_tensor.shape[1] != 1:
+                    # Ensure proper shape after concatenation
+                    if images_tensor.dim() == 3:
+                        # [N, 28, 28] -> [N, 1, 28, 28]
+                        images_tensor = images_tensor.unsqueeze(1)
+                    elif images_tensor.dim() != 4 or images_tensor.shape[1] != 1:
                         print(f"Warning: Unexpected train images_tensor shape {images_tensor.shape}")
                         continue
                     
