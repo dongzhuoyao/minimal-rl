@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dataset import MNISTDataset
 from model import create_mnist_model
-from rewards.mnist_rewards import CombinedMNISTReward, get_recommended_reward_config
+from rewards.mnist_rewards import get_recommended_reward_config
 
 
 class PerLabelStatTracker:

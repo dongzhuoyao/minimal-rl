@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from rewards.simple_reward import compute_shape_reward
+from rewards.mnist_rewards import compute_shape_reward
 
 def visualize_target_patterns():
     """Visualize the target patterns for each shape type."""

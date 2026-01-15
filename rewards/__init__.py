@@ -1,27 +1,11 @@
 """
 Rewards module for FlowGRPO training.
 
-This module contains reward functions for training flow matching models:
-- mnist_rewards.py: MNIST-specific reward functions
-- simple_reward.py: Simple reward functions for toy tasks
-- example_mnist_rewards.py: Examples for MNIST rewards
-- example_toy_rewards.py: Examples for toy rewards
-- visualize_reward.py: Visualization utilities for rewards
+This module contains reward functions for training flow matching models.
+All reward functions are consolidated in mnist_rewards.py.
 """
 
 from .mnist_rewards import (
-    MNISTClassifierReward,
-    MNISTConfidenceReward,
-    MNISTQualityReward,
-    MNISTPerceptualReward,
-    MNISTDiversityReward,
-    CombinedMNISTReward,
-    MNISTDigitZeroReward,
-    MNISTYellowReward,
-    MNISTColorReward,
-    MNISTYellowDigitReward,
-    MNISTGeometricReward,
-    MNISTAdversarialRobustnessReward,
     # Toy rewards
     MNISTBrightDigitReward,
     MNISTCenteredDigitReward,
@@ -31,29 +15,15 @@ from .mnist_rewards import (
     MNISTTinyDigitReward,
     # Config function
     get_recommended_reward_config,
-)
-
-from .simple_reward import (
+    # Simple rewards
     SimpleReward,
     SimpleDigitClassifier,
     compute_digit_reward,
     compute_shape_reward,
+    compute_reward,
 )
 
 __all__ = [
-    # MNIST rewards
-    'MNISTClassifierReward',
-    'MNISTConfidenceReward',
-    'MNISTQualityReward',
-    'MNISTPerceptualReward',
-    'MNISTDiversityReward',
-    'CombinedMNISTReward',
-    'MNISTDigitZeroReward',
-    'MNISTYellowReward',
-    'MNISTColorReward',
-    'MNISTYellowDigitReward',
-    'MNISTGeometricReward',
-    'MNISTAdversarialRobustnessReward',
     # Toy rewards
     'MNISTBrightDigitReward',
     'MNISTCenteredDigitReward',
@@ -68,4 +38,5 @@ __all__ = [
     'SimpleDigitClassifier',
     'compute_digit_reward',
     'compute_shape_reward',
+    'compute_reward',
 ]
