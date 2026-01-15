@@ -1019,6 +1019,11 @@ def main(cfg: DictConfig):
                         
                         label = sample["label"].item()
                         reward = sample["reward"]
+                        # Convert reward to scalar if it's a tensor or numpy array
+                        if hasattr(reward, 'item'):
+                            reward = reward.item()
+                        elif isinstance(reward, (np.ndarray, np.generic)):
+                            reward = float(reward)
                         advantage = sample["advantages"].item()
                         captions.append(f"L:{label} R:{reward:.4f} A:{advantage:.4f}")
                     
@@ -1053,7 +1058,9 @@ def main(cfg: DictConfig):
                     grid_np = (grid_np * 255).astype(np.uint8)
                     
                     grid_pil = Image.fromarray(grid_np, mode='RGB')
-                    log_dict["train/sampled_images"] = wandb.Image(grid_pil, caption="Training samples (Label, Reward, Advantage)")
+                    # Create combined caption from all individual captions
+                    combined_caption = " | ".join(captions)
+                    log_dict["train/sampled_images"] = wandb.Image(grid_pil, caption=combined_caption)
                     
                     # Record image statistics from batch samples
                     batch_images = torch.stack([s["image"] for s in batch_samples])
