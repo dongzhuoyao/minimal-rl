@@ -31,7 +31,7 @@ training:
   eval_freq: 500  # Frequency of evaluation (in steps)
   max_grad_norm: 1.0
   max_log_diff: 10.0  # Maximum log probability difference for numerical stability (prevents exp overflow)
-  adv_clip_max: 10.0  # Maximum absolute value for advantages (clipping)
+  adv_clip_max: 5.0  # Maximum absolute value for advantages (clipping)
   num_inner_epochs: 1  # Number of inner epochs to train on each batch of samples
   device: "auto"  # Options: "cpu", "cuda", "auto" (auto-detect)
   save_freq: 1000  # Frequency of checkpoint saving (in steps)
