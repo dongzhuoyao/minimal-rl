@@ -1,104 +1,76 @@
 """
 Visualize MNIST reward functions and examples.
 """
-import torch
+import sys
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
-from pathlib import Path
-import sys
+import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from dataset import MNISTDataset
 from rewards.mnist_rewards import (
     MNISTBrightDigitReward,
     MNISTCenteredDigitReward,
-    MNISTSparseDigitReward,
-    MNISTLargeDigitReward,
     MNISTHighContrastReward,
+    MNISTLargeDigitReward,
+    MNISTSparseDigitReward,
     MNISTTinyDigitReward,
 )
-from dataset import MNISTDataset
+
+# MNIST constants
+MNIST_MEAN = 0.1307
+MNIST_STD = 0.3081
+IMG_SIZE = 28
 
 
-def load_mnist_samples(num_samples=1000):
-    """Helper function to load and preprocess MNIST samples."""
+def denormalize_mnist(image: torch.Tensor) -> torch.Tensor:
+    """Denormalize MNIST image from normalized form to [0, 1] range."""
+    return torch.clamp(image * MNIST_STD + MNIST_MEAN, 0, 1)
+
+
+def load_mnist_samples(num_samples: int = 1000):
+    """Load and preprocess MNIST samples."""
     dataset = MNISTDataset("dataset", split="test", download=True)
-    H, W = 28, 28
-    
-    all_images = []
-    all_labels = []
-    
     sample_size = min(num_samples, len(dataset))
     indices = torch.randperm(len(dataset))[:sample_size]
-    
+
+    all_images = []
+    all_labels = []
+
     for idx in indices:
         sample = dataset[idx]
-        image_flat = sample["image"]  # [784] - normalized
-        label_raw = sample["label"]
-        
-        # Convert label to int if it's a tensor
-        if isinstance(label_raw, torch.Tensor):
-            label = int(label_raw.item())
-        else:
-            label = int(label_raw)
-        
-        # Denormalize: (x - 0.1307) / 0.3081 -> x
-        # So: x = image * 0.3081 + 0.1307
-        image_denorm = image_flat * 0.3081 + 0.1307
-        image_2d = image_denorm.view(1, H, W)  # [1, 28, 28]
-        image_2d = torch.clamp(image_2d, 0, 1)
-        
+        image_flat = sample["image"]
+        label = int(sample["label"].item()) if isinstance(sample["label"], torch.Tensor) else int(sample["label"])
+
+        image_2d = denormalize_mnist(image_flat).view(1, IMG_SIZE, IMG_SIZE)
         all_images.append(image_2d)
         all_labels.append(label)
-    
+
     return all_images, all_labels
+
+
+def compute_rewards_for_dataset(reward_fn, images, labels):
+    """Compute rewards for a list of images."""
+    rewards = []
+    for img, label in zip(images, labels):
+        prompt = f"digit {label}"
+        reward = reward_fn(img, [prompt]).item()
+        rewards.append(reward)
+    return rewards
 
 def visualize_large_reward():
     """Visualize the 'large' reward function with real MNIST data examples."""
     device = "cpu"
     reward_fn = MNISTLargeDigitReward(device=device, threshold=0.1)
-    
-    # Load real MNIST dataset
+
     print("Loading MNIST dataset...")
-    dataset = MNISTDataset("dataset", split="test", download=True)
-    
-    # Collect images and compute rewards
+    all_images, all_labels = load_mnist_samples(1000)
+
     print("Computing rewards for MNIST images...")
-    H, W = 28, 28
-    all_rewards = []
-    all_images = []
-    all_labels = []
-    
-    # Sample a subset of images to find diverse examples
-    sample_size = min(1000, len(dataset))
-    indices = torch.randperm(len(dataset))[:sample_size]
-    
-    for idx in indices:
-        sample = dataset[idx]
-        # Get image and denormalize from MNIST normalization
-        image_flat = sample["image"]  # [784] - normalized
-        label_raw = sample["label"]
-        
-        # Convert label to int if it's a tensor
-        if isinstance(label_raw, torch.Tensor):
-            label = int(label_raw.item())
-        else:
-            label = int(label_raw)
-        
-        # Denormalize: (x - 0.1307) / 0.3081 -> x
-        # So: x = image * 0.3081 + 0.1307
-        image_denorm = image_flat * 0.3081 + 0.1307
-        image_2d = image_denorm.view(1, H, W)  # [1, 28, 28]
-        
-        # Clamp to [0, 1] and ensure it's in the right format
-        image_2d = torch.clamp(image_2d, 0, 1)
-        
-        # Compute reward
-        prompt = f"digit {label}"
-        reward = reward_fn(image_2d, [prompt]).item()
-        
-        all_rewards.append(reward)
-        all_images.append(image_2d)
-        all_labels.append(label)
+    all_rewards = compute_rewards_for_dataset(reward_fn, all_images, all_labels)
     
     # Find examples with high and low rewards
     all_rewards_tensor = torch.tensor(all_rewards)

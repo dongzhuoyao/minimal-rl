@@ -5,30 +5,33 @@ Flow matching is a supervised learning approach where the model learns to predic
 the velocity field that transforms noise to data.
 
 Usage:
-    python train0.py                          # Use default config
+    python train0.py                           # Use default config
     python train0.py training.num_steps=10000  # Override specific parameter
-    python train0.py training.lr=0.0005      # Override learning rate
+    python train0.py training.lr=0.0005        # Override learning rate
 """
-import hydra
-from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig, OmegaConf
+import os
+import sys
 from pathlib import Path
+
+import hydra
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-import sys
-from tqdm import tqdm
-import os
 import wandb
+from hydra.core.hydra_config import HydraConfig
+from omegaconf import DictConfig, OmegaConf
+from PIL import Image
+from torch.utils.data import DataLoader
+from torchvision.utils import make_grid
+from tqdm import tqdm
 
-# Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dataset import MNISTDataset
 from model import SimpleUNet
-import numpy as np
-from PIL import Image
-from torchvision.utils import make_grid
+
+# Constants
+MNIST_IMG_SIZE = 28
 
 
 @hydra.main(version_base=None, config_path=".", config_name="train0")
@@ -109,55 +112,22 @@ def main(cfg: DictConfig):
         time_emb_dim=cfg.model.get("time_emb_dim", 128),
     )
     model.to(device)
+    total_params = model.count_parameters()
     
-    # Count parameters
-    def count_parameters(model):
-        """Count the number of trainable parameters in a model."""
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    total_params = count_parameters(model)
-    
-    # Sampling function for flow matching
-    def sample_images(model, num_samples=8, num_steps=50, sigma_max=80.0, device=None):
-        """
-        Sample images from the flow matching model using Euler integration.
-        
-        Args:
-            model: The flow matching model
-            num_samples: Number of images to sample
-            num_steps: Number of integration steps
-            sigma_max: Maximum sigma value
-            device: Device to run on
-        """
-        if device is None:
-            device = next(model.parameters()).device
+    def sample_images(num_samples=8, num_steps=50, sigma_max=80.0):
+        """Sample images from the flow matching model using Euler integration."""
         model.eval()
         with torch.no_grad():
-            # Sample random labels (digits 0-9)
             labels = torch.randint(0, cfg.model.vocab_size, (num_samples,), device=device)
-            
-            # Start from noise: x_1 ~ N(0, I)
-            x = torch.randn(num_samples, 1, 28, 28, device=device)
-            
-            # Time steps from 1 to 0 (backwards)
+            x = torch.randn(num_samples, 1, MNIST_IMG_SIZE, MNIST_IMG_SIZE, device=device)
             timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
             dt = 1.0 / num_steps
-            
-            # Euler integration: x_{t-dt} = x_t - dt * v_pred
+
             for i in range(num_steps):
-                t = timesteps[i]
-                sigma = t * sigma_max
-                
-                # Predict velocity
-                v_pred = model(x, sigma, labels)
-                
-                # Euler step: x_{t-dt} = x_t - dt * v_pred
-                x = x - dt * v_pred
-            
-            # Clamp to valid range [0, 1] for MNIST
-            x = torch.clamp(x, 0.0, 1.0)
-            
-        return x, labels
+                sigma = timesteps[i] * sigma_max
+                x = x - dt * model(x, sigma, labels)
+
+            return torch.clamp(x, 0.0, 1.0), labels
     
     def images_to_wandb(images, labels, num_images=8):
         """
@@ -366,13 +336,11 @@ def main(cfg: DictConfig):
             print(f"Test Loss: {avg_test_loss:.6f} ± {test_loss_std:.6f}")
             
             # Sample images for visualization
-            num_samples = cfg.wandb.get("num_sample_images", 8) if cfg.wandb.enabled else 8
+            num_vis_samples = cfg.wandb.get("num_sample_images", 8) if cfg.wandb.enabled else 8
             sampled_images, sampled_labels = sample_images(
-                model, 
-                num_samples=num_samples,
+                num_samples=num_vis_samples,
                 num_steps=cfg.wandb.get("num_sampling_steps", 50) if cfg.wandb.enabled else 50,
                 sigma_max=cfg.model.get("sigma_max", 80.0),
-                device=device
             )
             
             # Save sampled images as grid using make_grid
@@ -394,7 +362,7 @@ def main(cfg: DictConfig):
             
             # Log to wandb
             if cfg.wandb.enabled:
-                wandb_images = images_to_wandb(sampled_images, sampled_labels, num_samples)
+                wandb_images = images_to_wandb(sampled_images, sampled_labels, num_vis_samples)
                 eval_log_dict = {
                     "eval/train_loss": avg_train_loss,
                     "eval/test_loss": avg_test_loss,

@@ -108,8 +108,6 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
 import sys
@@ -119,7 +117,6 @@ import wandb
 import numpy as np
 from PIL import Image
 from collections import defaultdict
-import copy
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -127,6 +124,64 @@ sys.path.insert(0, str(Path(__file__).parent))
 from dataset import MNISTDataset
 from model import SimpleUNet
 from rewards.mnist_rewards import get_recommended_reward_config
+from utils import ensure_image_shape, to_scalar
+
+# Constants
+MNIST_IMG_SIZE = 28
+MNIST_SIGNAL_DIM = MNIST_IMG_SIZE * MNIST_IMG_SIZE  # 784
+
+
+def create_image_grid(images: list, labels: list, rewards: list, advantages: list = None) -> tuple:
+    """
+    Create a grid of images with captions for wandb logging.
+
+    Args:
+        images: List of image tensors [1, 28, 28] or [28, 28]
+        labels: List of label values
+        rewards: List of reward values
+        advantages: Optional list of advantage values
+
+    Returns:
+        Tuple of (PIL image, combined caption string) or (None, None) if failed
+    """
+    if not images:
+        return None, None
+
+    processed_images = []
+    captions = []
+
+    for i, img in enumerate(images):
+        try:
+            img_cpu = img.cpu() if img.is_cuda else img
+            img_shaped = ensure_image_shape(img_cpu, 1, MNIST_IMG_SIZE, MNIST_IMG_SIZE)
+            processed_images.append(img_shaped)
+
+            label = labels[i].item() if hasattr(labels[i], 'item') else labels[i]
+            reward = to_scalar(rewards[i])
+
+            if advantages is not None:
+                adv = to_scalar(advantages[i])
+                captions.append(f"L:{label} R:{reward:.4f} A:{adv:.4f}")
+            else:
+                captions.append(f"L:{label} R:{reward:.4f}")
+        except (ValueError, RuntimeError) as e:
+            continue
+
+    if not processed_images:
+        return None, None
+
+    # Stack and create grid
+    images_tensor = torch.stack(processed_images)  # [N, 1, 28, 28]
+    images_tensor = torch.clamp(images_tensor, 0.0, 1.0)
+    grid = make_grid(images_tensor, nrow=4, normalize=False, pad_value=1.0)
+
+    # Convert to PIL
+    grid_np = grid.permute(1, 2, 0).cpu().numpy()
+    grid_np = np.clip(grid_np, 0.0, 1.0)
+    grid_np = (grid_np * 255).astype(np.uint8)
+    grid_pil = Image.fromarray(grid_np, mode='RGB')
+
+    return grid_pil, " | ".join(captions)
 
 
 class PerLabelStatTracker:
@@ -257,14 +312,11 @@ def sample_with_logprob(model, labels, num_steps, device, return_trajectory=Fals
     if not enable_grad:
         model.eval()
     B = labels.shape[0]
-    signal_dim = 784  # MNIST: 28x28 = 784
-    img_size = 28
-    
+
     # Initialize with noise: x_1 ~ N(0, I) (matching train0.py)
-    # Use image format [B, 1, 28, 28] directly (matching train0.py)
-    x = torch.randn(B, 1, img_size, img_size, device=device)
+    x = torch.randn(B, 1, MNIST_IMG_SIZE, MNIST_IMG_SIZE, device=device)
     
-    trajectory = [x.clone().view(B, signal_dim)] if return_trajectory else None
+    trajectory = [x.clone().view(B, MNIST_SIGNAL_DIM)] if return_trajectory else None
     log_probs = []
     timesteps = []
     
@@ -291,18 +343,17 @@ def sample_with_logprob(model, labels, num_steps, device, return_trajectory=Fals
             
             # Compute log probability for this step
             # For flow matching: log p ≈ -0.5 * ||v||^2 * dt
-            v_flat = v_pred.view(B, signal_dim)  # [B, signal_dim]
+            v_flat = v_pred.view(B, MNIST_SIGNAL_DIM)
             log_prob = -0.5 * torch.sum(v_flat ** 2, dim=-1) * dt
             log_probs.append(log_prob)
             timesteps.append(torch.full((B,), t, device=device))
-            
+
             # Euler step: x_{t-dt} = x_t - dt * v_pred (matching train0.py)
-            # Going backwards in time: subtract velocity
             x = x - dt * v_pred
-            
+
             # Store trajectory if needed (flattened for consistency)
             if return_trajectory:
-                trajectory.append(x.clone().view(B, signal_dim))
+                trajectory.append(x.clone().view(B, MNIST_SIGNAL_DIM))
     
     log_probs = torch.stack(log_probs, dim=1)  # [B, num_steps]
     timesteps = torch.stack(timesteps, dim=1)  # [B, num_steps] - each row is the same t value
@@ -557,8 +608,7 @@ def main(cfg: DictConfig):
         time_emb_dim=cfg.model.get("time_emb_dim", 40),
     )
     model.to(device)
-    signal_dim = cfg.model.signal_dim  # Store signal_dim for use in functions
-    
+
     # Load pretrained checkpoint
     checkpoint = load_pretrained_checkpoint(
         model=model,
@@ -641,131 +691,21 @@ def main(cfg: DictConfig):
         
         # Visualize sampled images in wandb periodically
         if cfg.wandb.enabled and step % cfg.wandb.log_freq == 0:
-            try:
-                # Create grid of sampled images with rewards
-                num_images_to_show = min(16, images_for_reward.shape[0])
-                if num_images_to_show == 0:
-                    continue
-                    
-                images_to_grid = []
-                captions = []
-                rewards_cpu = rewards.cpu()
-                for i in range(num_images_to_show):
-                    # Extract image maintaining channel dimension
-                    img = images_for_reward[i:i+1].cpu()  # [1, 1, 28, 28] - keep batch dim
-                    img = img.squeeze(0)  # [1, 28, 28] - remove batch dim but keep channel
-                    
-                    # Ensure image has correct shape [1, 28, 28]
-                    if img.dim() == 2:
-                        # [28, 28] -> [1, 28, 28]
-                        img = img.unsqueeze(0)
-                    elif img.dim() == 3:
-                        if img.shape[0] != 1:
-                            # If shape is [28, 28, 1] or [28, 28, C], fix it
-                            if img.shape[2] == 1:
-                                img = img.permute(2, 0, 1)  # [28, 28, 1] -> [1, 28, 28]
-                            elif img.shape[0] == 28 and img.shape[1] == 28:
-                                img = img[:, :, 0].unsqueeze(0) if img.shape[2] > 1 else img.unsqueeze(0)
-                    
-                    # Final validation - ensure [1, 28, 28]
-                    if img.dim() == 2:
-                        img = img.unsqueeze(0)
-                    if img.dim() != 3 or img.shape[0] != 1:
-                        # Force to [1, 28, 28]
-                        if img.dim() == 2:
-                            img = img.unsqueeze(0)
-                        elif img.dim() == 3 and img.shape[0] != 1:
-                            if img.shape[0] == 28:
-                                img = img.unsqueeze(0)
-                            else:
-                                print(f"Warning: Cannot fix image {i} shape {img.shape}, skipping")
-                                continue
-                    
-                    images_to_grid.append(img)
-                    label = expanded_labels[i].item()
-                    reward = rewards_cpu[i].item()
-                    captions.append(f"L:{label} R:{reward:.4f}")
-                
-                if len(images_to_grid) == 0:
-                    continue
-                
-                # Stack images and create grid
-                images_tensor = torch.cat(images_to_grid, dim=0)  # Should be [N, 1, 28, 28]
-                
-                # Fix shape if needed
-                if images_tensor.dim() == 3:
-                    # [N, 28, 28] -> [N, 1, 28, 28]
-                    images_tensor = images_tensor.unsqueeze(1)
-                elif images_tensor.dim() != 4:
-                    print(f"Error: images_tensor has {images_tensor.dim()} dimensions, expected 4. Shape: {images_tensor.shape}")
-                    continue
-                
-                # Ensure channel dimension is 1
-                if images_tensor.shape[1] != 1:
-                    if images_tensor.shape[1] == 28 and images_tensor.shape[2] == 28:
-                        # [N, 28, 28, C] or similar - reshape
-                        images_tensor = images_tensor.unsqueeze(1) if images_tensor.dim() == 3 else images_tensor
-                    else:
-                        print(f"Error: images_tensor channel dimension is {images_tensor.shape[1]}, expected 1. Shape: {images_tensor.shape}")
-                        continue
-                
-                if images_tensor.shape[1] != 1:
-                    print(f"Error: images_tensor channel dimension is {images_tensor.shape[1]}, expected 1. Shape: {images_tensor.shape}")
-                    continue
-                
-                # Ensure images are in [0, 1] range
-                images_tensor = torch.clamp(images_tensor, 0.0, 1.0)
-                
-                grid = make_grid(images_tensor, nrow=4, normalize=False, pad_value=1.0)  # [3, H, W] - make_grid converts grayscale to RGB
-                
-                # Debug: Check grid shape
-                if grid.dim() != 3:
-                    print(f"Error: grid has {grid.dim()} dimensions, expected 3. Shape: {grid.shape}, input shape: {images_tensor.shape}")
-                    continue
-                
-                if grid.shape[0] != 3:
-                    print(f"Error: grid first dimension is {grid.shape[0]}, expected 3. Shape: {grid.shape}, input shape: {images_tensor.shape}")
-                    continue
-                
-                # Convert to numpy: [C, H, W] -> [H, W, C]
-                grid_np = grid.permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
-                
-                # Final shape check before PIL conversion
-                if len(grid_np.shape) != 3:
-                    print(f"Error: grid_np has {len(grid_np.shape)} dimensions after permute, expected 3. Shape: {grid_np.shape}")
-                    continue
-                
-                if grid_np.shape[2] != 3:
-                    print(f"Error: grid_np channel dimension is {grid_np.shape[2]}, expected 3. Shape: {grid_np.shape}, original grid shape: {grid.shape}")
-                    continue
-                
-                if grid_np.shape[0] < 10 or grid_np.shape[1] < 10:
-                    print(f"Error: grid_np spatial dimensions too small: {grid_np.shape}, original grid shape: {grid.shape}")
-                    continue
-                
-                grid_np = np.clip(grid_np, 0.0, 1.0)
-                grid_np = (grid_np * 255).astype(np.uint8)
-                
-                grid_pil = Image.fromarray(grid_np, mode='RGB')
-                
-                # Record image statistics
-                img_min = images_for_reward.min().item()
-                img_max = images_for_reward.max().item()
-                img_mean = images_for_reward.mean().item()
-                img_std = images_for_reward.std().item()
-                
-                caption_text = " | ".join(captions)
-                wandb.log({
-                    "sampling/generated_images": wandb.Image(grid_pil, caption=caption_text),
-                    "sampling/image_min": img_min,
-                    "sampling/image_max": img_max,
-                    "sampling/image_mean": img_mean,
-                    "sampling/image_std": img_std,
-                }, step=step)
-            except Exception as e:
-                print(f"Warning: Failed to visualize images at step {step}: {e}")
-                import traceback
-                traceback.print_exc()
+            num_images_to_show = min(16, images_for_reward.shape[0])
+            if num_images_to_show > 0:
+                grid_pil, caption = create_image_grid(
+                    images=[images_for_reward[i] for i in range(num_images_to_show)],
+                    labels=[expanded_labels[i] for i in range(num_images_to_show)],
+                    rewards=[rewards[i] for i in range(num_images_to_show)],
+                )
+                if grid_pil is not None:
+                    wandb.log({
+                        "sampling/generated_images": wandb.Image(grid_pil, caption=caption),
+                        "sampling/image_min": images_for_reward.min().item(),
+                        "sampling/image_max": images_for_reward.max().item(),
+                        "sampling/image_mean": images_for_reward.mean().item(),
+                        "sampling/image_std": images_for_reward.std().item(),
+                    }, step=step)
         
         rewards = rewards.cpu().numpy()
         
@@ -862,10 +802,9 @@ def main(cfg: DictConfig):
                     trajectories_list.append(s["trajectory"])
                     timesteps_list.append(s["timesteps"])
                 
-                # Convert to tensors: [B, num_steps+1, signal_dim]
+                # Convert to tensors: [B, num_steps+1, MNIST_SIGNAL_DIM]
                 max_len = max(len(traj) for traj in trajectories_list)
-                signal_dim = trajectories_list[0][0].shape[0]
-                trajectories_tensor = torch.zeros(len(batch_samples), max_len, signal_dim, device=device)
+                trajectories_tensor = torch.zeros(len(batch_samples), max_len, MNIST_SIGNAL_DIM, device=device)
                 for i, traj in enumerate(trajectories_list):
                     for j, state in enumerate(traj):
                         trajectories_tensor[i, j] = state
@@ -988,87 +927,24 @@ def main(cfg: DictConfig):
                     if beta > 0:
                         log_dict["train/kl_loss"] = float(np.mean(info["kl_loss"]))
 
-                    print(log_dict)
-                    
-                    # Visualize sampled images during training using make_grid
+                    # Visualize sampled images during training
                     num_images_to_log = min(16, len(batch_samples))
-                    images_to_grid = []
-                    captions = []
-                    for i in range(num_images_to_log):
-                        sample = batch_samples[i]
-                        img = sample["image"].cpu()  # Should be [1, 28, 28]
-                        
-                        # Ensure proper shape: [1, 28, 28]
-                        if img.dim() == 2:
-                            # [28, 28] -> [1, 28, 28]
-                            img = img.unsqueeze(0)
-                        elif img.dim() == 3:
-                            if img.shape[0] != 1:
-                                # If shape is [28, 28, 1] or similar, fix it
-                                if img.shape[2] == 1:
-                                    img = img.permute(2, 0, 1)  # [28, 28, 1] -> [1, 28, 28]
-                                elif img.shape[0] == 28 and img.shape[1] == 28:
-                                    img = img.unsqueeze(0)  # [28, 28] -> [1, 28, 28]
-                        
-                        # Final validation
-                        if img.dim() != 3 or img.shape[0] != 1:
-                            print(f"Warning: Cannot fix image {i} shape {img.shape}, skipping")
-                            continue
-                        
-                        images_to_grid.append(img)
-                        
-                        label = sample["label"].item()
-                        reward = sample["reward"]
-                        # Convert reward to scalar if it's a tensor or numpy array
-                        if hasattr(reward, 'item'):
-                            reward = reward.item()
-                        elif isinstance(reward, (np.ndarray, np.generic)):
-                            reward = float(reward)
-                        advantage = sample["advantages"].item()
-                        captions.append(f"L:{label} R:{reward:.4f} A:{advantage:.4f}")
-                    
-                    if len(images_to_grid) == 0:
-                        continue
-                    
-                    # Stack images and create grid
-                    images_tensor = torch.cat(images_to_grid, dim=0)  # [N, 1, 28, 28]
-                    
-                    # Ensure proper shape after concatenation
-                    if images_tensor.dim() == 3:
-                        # [N, 28, 28] -> [N, 1, 28, 28]
-                        images_tensor = images_tensor.unsqueeze(1)
-                    elif images_tensor.dim() != 4 or images_tensor.shape[1] != 1:
-                        print(f"Warning: Unexpected train images_tensor shape {images_tensor.shape}")
-                        continue
-                    
-                    grid = make_grid(images_tensor, nrow=4, normalize=False, pad_value=1.0)  # [3, H, W] - make_grid converts grayscale to RGB
-                    
-                    if grid.dim() != 3 or grid.shape[0] != 3:
-                        print(f"Warning: Unexpected train grid shape {grid.shape}")
-                        continue
-                    
-                    # Convert to numpy: [C, H, W] -> [H, W, C]
-                    grid_np = grid.permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
-                    
-                    if grid_np.shape[2] != 3 or grid_np.shape[0] < 10 or grid_np.shape[1] < 10:
-                        print(f"Warning: Invalid train grid_np shape {grid_np.shape}")
-                        continue
-                    
-                    grid_np = np.clip(grid_np, 0.0, 1.0)
-                    grid_np = (grid_np * 255).astype(np.uint8)
-                    
-                    grid_pil = Image.fromarray(grid_np, mode='RGB')
-                    # Create combined caption from all individual captions
-                    combined_caption = " | ".join(captions)
-                    log_dict["train/sampled_images"] = wandb.Image(grid_pil, caption=combined_caption)
-                    
-                    # Record image statistics from batch samples
-                    batch_images = torch.stack([s["image"] for s in batch_samples])
-                    log_dict["train/image_min"] = batch_images.min().item()
-                    log_dict["train/image_max"] = batch_images.max().item()
-                    log_dict["train/image_mean"] = batch_images.mean().item()
-                    log_dict["train/image_std"] = batch_images.std().item()
-                    
+                    grid_pil, caption = create_image_grid(
+                        images=[s["image"] for s in batch_samples[:num_images_to_log]],
+                        labels=[s["label"] for s in batch_samples[:num_images_to_log]],
+                        rewards=[s["reward"] for s in batch_samples[:num_images_to_log]],
+                        advantages=[s["advantages"] for s in batch_samples[:num_images_to_log]],
+                    )
+                    if grid_pil is not None:
+                        log_dict["train/sampled_images"] = wandb.Image(grid_pil, caption=caption)
+
+                        # Record image statistics from batch samples
+                        batch_images = torch.stack([s["image"] for s in batch_samples])
+                        log_dict["train/image_min"] = batch_images.min().item()
+                        log_dict["train/image_max"] = batch_images.max().item()
+                        log_dict["train/image_mean"] = batch_images.mean().item()
+                        log_dict["train/image_std"] = batch_images.std().item()
+
                     wandb.log(log_dict, step=step)
                 
                 # Evaluation and checkpointing
@@ -1085,45 +961,20 @@ def main(cfg: DictConfig):
                                 device=device,
                                 sigma_max=cfg.model.get("sigma_max", 80.0),
                             )
-                            # Images are already in [0, 1] range from sample_with_logprob
-                            
-                            # Create grid of evaluation images
-                            if test_images.dim() != 4 or test_images.shape[1] != 1:
-                                print(f"Warning: Unexpected eval test_images shape {test_images.shape}")
-                                continue
-                            
-                            eval_grid = make_grid(test_images, nrow=4, normalize=False, pad_value=1.0)  # [3, H, W] - make_grid converts grayscale to RGB
-                            
-                            if eval_grid.dim() != 3 or eval_grid.shape[0] != 3:
-                                print(f"Warning: Unexpected eval grid shape {eval_grid.shape}")
-                                continue
-                            
-                            # Convert to numpy: [C, H, W] -> [H, W, C]
-                            eval_grid_np = eval_grid.permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
-                            
-                            if eval_grid_np.shape[2] != 3 or eval_grid_np.shape[0] < 10 or eval_grid_np.shape[1] < 10:
-                                print(f"Warning: Invalid eval grid_np shape {eval_grid_np.shape}")
-                                continue
-                            
+                            # Create grid using make_grid directly (simpler for eval without rewards)
+                            eval_grid = make_grid(test_images, nrow=4, normalize=False, pad_value=1.0)
+                            eval_grid_np = eval_grid.permute(1, 2, 0).cpu().numpy()
                             eval_grid_np = np.clip(eval_grid_np, 0.0, 1.0)
                             eval_grid_np = (eval_grid_np * 255).astype(np.uint8)
-                            
                             eval_grid_pil = Image.fromarray(eval_grid_np, mode='RGB')
-                            
-                            # Record evaluation image statistics
-                            eval_img_min = test_images.min().item()
-                            eval_img_max = test_images.max().item()
-                            eval_img_mean = test_images.mean().item()
-                            eval_img_std = test_images.std().item()
-                            
-                            # Create caption with labels
+
                             label_captions = ", ".join([f"L{i}:{test_labels[i].item()}" for i in range(len(test_labels))])
                             wandb.log({
-                                "eval/sampled_images": wandb.Image(eval_grid_pil, caption=f"Evaluation samples - {label_captions}"),
-                                "eval/image_min": eval_img_min,
-                                "eval/image_max": eval_img_max,
-                                "eval/image_mean": eval_img_mean,
-                                "eval/image_std": eval_img_std,
+                                "eval/sampled_images": wandb.Image(eval_grid_pil, caption=f"Eval - {label_captions}"),
+                                "eval/image_min": test_images.min().item(),
+                                "eval/image_max": test_images.max().item(),
+                                "eval/image_mean": test_images.mean().item(),
+                                "eval/image_std": test_images.std().item(),
                             }, step=step)
                         model.train()
                     
