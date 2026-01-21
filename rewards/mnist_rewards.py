@@ -32,15 +32,23 @@ def _preprocess_images(images: torch.Tensor) -> torch.Tensor:
 def get_recommended_reward_config(config_name: str = 'large', device: str = 'cuda'):
     """
     Get recommended reward configurations for different training objectives.
-    
-    Configurations:
+
+    Toy rewards (easy to hack):
     - 'large': Reward for large digits (default)
     - 'bright': Reward brighter digits
     - 'centered': Reward centered digits
     - 'sparse': Reward sparse digits
     - 'contrast': Reward high contrast
     - 'tiny': Reward tiny digits
+
+    Hack-resistant rewards:
+    - 'composite': Combined large + centered + contrast
+    - 'bounded': Rewards 15-35% pixel coverage
+    - 'bimodal': Requires both black AND white regions
+    - 'connected': Penalizes fragmented/scattered pixels
+    - 'stroke': Rewards consistent stroke widths
     """
+    # Lazy import to avoid circular dependency
     configs = {
         # Toy rewards for experimentation
         'bright': MNISTBrightDigitReward(device=device),
@@ -49,8 +57,14 @@ def get_recommended_reward_config(config_name: str = 'large', device: str = 'cud
         'large': MNISTLargeDigitReward(device=device),
         'contrast': MNISTHighContrastReward(device=device),
         'tiny': MNISTTinyDigitReward(device=device),
+        # Hack-resistant rewards
+        'composite': MNISTCompositeReward(device=device),
+        'bounded': MNISTBoundedSizeReward(device=device),
+        'bimodal': MNISTBimodalReward(device=device),
+        'connected': MNISTConnectedReward(device=device),
+        'stroke': MNISTStrokeConsistencyReward(device=device),
     }
-    
+
     return configs.get(config_name, configs['large'])
 
 
@@ -261,23 +275,23 @@ class MNISTHighContrastReward:
 class MNISTTinyDigitReward:
     """
     Toy reward: Rewards tiny digits (small bounding box).
-    
+
     Encourages digits that occupy a small area in the image, creating
     minimalist, compact digit representations.
-    
+
     Pros:
     - Creates interesting compact digits
     - Demonstrates bounding box-based rewards
-    
+
     Cons:
     - May make digits too small to recognize
     - Doesn't ensure correctness
-    
+
     Usage:
         reward_fn = MNISTTinyDigitReward(device='cuda')
         rewards = reward_fn(images, prompts)
     """
-    
+
     def __init__(self, device='cuda', threshold=0.1):
         """
         Args:
@@ -286,7 +300,7 @@ class MNISTTinyDigitReward:
         """
         self.device = device
         self.threshold = threshold
-    
+
     def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
         """Compute size-based rewards (smaller = better)."""
         images = _preprocess_images(images)
@@ -306,6 +320,243 @@ class MNISTTinyDigitReward:
             rewards.append(reward)
 
         return torch.clamp(torch.tensor(rewards, device=self.device), 0.0, 1.0)
+
+
+# ============================================================================
+# HACK-RESISTANT REWARDS - Harder to exploit with degenerate solutions
+# ============================================================================
+
+class MNISTCompositeReward:
+    """
+    Hack-resistant reward: Combines multiple competing objectives.
+
+    By requiring large, centered, AND high-contrast digits simultaneously,
+    it's hard to find a degenerate solution that maximizes all three.
+
+    Usage:
+        reward_fn = MNISTCompositeReward(device='cuda')
+        rewards = reward_fn(images, prompts)
+    """
+
+    def __init__(self, device='cuda', weights=(0.4, 0.3, 0.3)):
+        """
+        Args:
+            device: Device to run on
+            weights: (large_weight, centered_weight, contrast_weight)
+        """
+        self.device = device
+        self.weights = weights
+        self.large_reward = MNISTLargeDigitReward(device=device)
+        self.centered_reward = MNISTCenteredDigitReward(device=device)
+        self.contrast_reward = MNISTHighContrastReward(device=device)
+
+    def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
+        """Compute composite reward from multiple objectives."""
+        r_large = self.large_reward(images, prompts, **kwargs)
+        r_centered = self.centered_reward(images, prompts, **kwargs)
+        r_contrast = self.contrast_reward(images, prompts, **kwargs)
+
+        combined = (
+            self.weights[0] * r_large +
+            self.weights[1] * r_centered +
+            self.weights[2] * r_contrast
+        )
+        return torch.clamp(combined, 0.0, 1.0)
+
+
+class MNISTBoundedSizeReward:
+    """
+    Hack-resistant reward: Rewards pixel coverage within a target range.
+
+    Unlike 'large' which just maximizes pixels, this requires coverage
+    to be within [min_coverage, max_coverage]. Too few or too many pixels
+    both get penalized, preventing both blank and all-white hacks.
+
+    Usage:
+        reward_fn = MNISTBoundedSizeReward(device='cuda')
+        rewards = reward_fn(images, prompts)
+    """
+
+    def __init__(self, device='cuda', min_coverage=0.15, max_coverage=0.35, threshold=0.1):
+        """
+        Args:
+            device: Device to run on
+            min_coverage: Minimum fraction of active pixels (default 15%)
+            max_coverage: Maximum fraction of active pixels (default 35%)
+            threshold: Pixel value threshold for "active" (default 0.1)
+        """
+        self.device = device
+        self.min_coverage = min_coverage
+        self.max_coverage = max_coverage
+        self.threshold = threshold
+        self.target_coverage = (min_coverage + max_coverage) / 2
+
+    def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
+        """Compute bounded size reward."""
+        images = _preprocess_images(images)
+        active_pixels = (images > self.threshold).float()
+        coverage = active_pixels.view(images.shape[0], -1).mean(dim=1)
+
+        # Reward is 1.0 at target, decreases linearly outside bounds
+        deviation = torch.abs(coverage - self.target_coverage)
+        half_range = (self.max_coverage - self.min_coverage) / 2
+        rewards = 1.0 - deviation / half_range
+
+        return torch.clamp(rewards, 0.0, 1.0)
+
+
+class MNISTBimodalReward:
+    """
+    Hack-resistant reward: Requires both dark AND bright regions.
+
+    Rewards images with high contrast (std) AND a specific mean brightness.
+    This prevents all-black or all-white solutions since both fail.
+
+    Usage:
+        reward_fn = MNISTBimodalReward(device='cuda')
+        rewards = reward_fn(images, prompts)
+    """
+
+    def __init__(self, device='cuda', target_mean=0.15, target_std=0.25):
+        """
+        Args:
+            device: Device to run on
+            target_mean: Target mean brightness (default 0.15, typical for MNIST)
+            target_std: Target std for bimodal distribution (default 0.25)
+        """
+        self.device = device
+        self.target_mean = target_mean
+        self.target_std = target_std
+
+    def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
+        """Compute bimodal distribution reward."""
+        images = _preprocess_images(images)
+        flat = images.view(images.shape[0], -1)
+
+        mean_brightness = flat.mean(dim=1)
+        std_brightness = flat.std(dim=1)
+
+        # Penalize deviation from target mean and std
+        mean_penalty = torch.abs(mean_brightness - self.target_mean) / self.target_mean
+        std_penalty = torch.abs(std_brightness - self.target_std) / self.target_std
+
+        rewards = 1.0 - 0.5 * mean_penalty - 0.5 * std_penalty
+        return torch.clamp(rewards, 0.0, 1.0)
+
+
+class MNISTConnectedReward:
+    """
+    Hack-resistant reward: Penalizes fragmented/scattered pixels.
+
+    Uses a simple approximation of connectivity by measuring how many
+    active pixels have active neighbors. Random noise has low connectivity;
+    coherent strokes have high connectivity.
+
+    Usage:
+        reward_fn = MNISTConnectedReward(device='cuda')
+        rewards = reward_fn(images, prompts)
+    """
+
+    def __init__(self, device='cuda', threshold=0.1):
+        """
+        Args:
+            device: Device to run on
+            threshold: Pixel value threshold for "active" (default 0.1)
+        """
+        self.device = device
+        self.threshold = threshold
+        # 3x3 connectivity kernel (counts neighbors)
+        self.kernel = torch.ones(1, 1, 3, 3, device=device) / 8.0
+        self.kernel[0, 0, 1, 1] = 0  # Don't count self
+
+    def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
+        """Compute connectivity-based reward."""
+        images = _preprocess_images(images).to(self.device)
+        binary = (images > self.threshold).float()
+
+        # Count active neighbors for each pixel
+        neighbor_count = torch.nn.functional.conv2d(
+            binary, self.kernel, padding=1
+        )
+
+        # For active pixels, what fraction of neighbors are also active?
+        active_mask = binary > 0
+        if active_mask.sum() == 0:
+            return torch.zeros(images.shape[0], device=self.device)
+
+        # Connectivity score: avg neighbor density for active pixels
+        connectivity = (neighbor_count * binary).view(images.shape[0], -1).sum(dim=1)
+        num_active = binary.view(images.shape[0], -1).sum(dim=1)
+
+        # Avoid division by zero
+        connectivity_score = connectivity / (num_active + 1e-8)
+
+        # Also require minimum active pixels (avoid empty images)
+        min_pixels = 0.05 * images.shape[-1] * images.shape[-2]
+        has_content = (num_active > min_pixels).float()
+
+        rewards = connectivity_score * has_content
+        return torch.clamp(rewards, 0.0, 1.0)
+
+
+class MNISTStrokeConsistencyReward:
+    """
+    Hack-resistant reward: Rewards consistent stroke widths.
+
+    Real digits have relatively consistent stroke widths. This reward
+    measures local stroke consistency using morphological operations.
+    Noise or blobs have inconsistent "strokes".
+
+    Usage:
+        reward_fn = MNISTStrokeConsistencyReward(device='cuda')
+        rewards = reward_fn(images, prompts)
+    """
+
+    def __init__(self, device='cuda', threshold=0.1):
+        """
+        Args:
+            device: Device to run on
+            threshold: Pixel value threshold for "active" (default 0.1)
+        """
+        self.device = device
+        self.threshold = threshold
+
+    def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
+        """Compute stroke consistency reward."""
+        images = _preprocess_images(images).to(self.device)
+        binary = (images > self.threshold).float()
+        batch_size = images.shape[0]
+
+        rewards = []
+        for i in range(batch_size):
+            img = binary[i, 0]
+
+            # Find edge pixels (active pixels with at least one inactive neighbor)
+            # Use simple gradient magnitude as proxy
+            grad_y = torch.abs(img[1:, :] - img[:-1, :])
+            grad_x = torch.abs(img[:, 1:] - img[:, :-1])
+
+            # Pad gradients back to original size
+            grad_y = torch.nn.functional.pad(grad_y, (0, 0, 0, 1))
+            grad_x = torch.nn.functional.pad(grad_x, (0, 1, 0, 0))
+
+            edge_magnitude = grad_y + grad_x
+
+            # Compute ratio of edge pixels to total active pixels
+            num_active = img.sum()
+            num_edge = (edge_magnitude > 0).float().sum()
+
+            if num_active < 10:  # Too few pixels
+                rewards.append(0.0)
+            else:
+                # Higher perimeter-to-area ratio = thinner strokes
+                # Target ratio around 0.5-0.7 for typical digit strokes
+                ratio = num_edge / num_active
+                # Reward peaks at ratio ~0.6, drops for very thin or very thick
+                reward = 1.0 - torch.abs(ratio - 0.6) / 0.6
+                rewards.append(float(torch.clamp(reward, 0.0, 1.0)))
+
+        return torch.tensor(rewards, device=self.device)
 
 
 # ============================================================================

@@ -22,13 +22,13 @@ model:
 # Training hyperparameters
 training:
   max_steps: 100000  # Maximum number of training steps
-  batch_size: 4
+  batch_size: 16
   num_samples_per_label: 4
   num_steps: 20  # Number of flow matching steps per sample
   eval_num_steps: 20  # Number of flow matching steps for evaluation
   lr: 2e-6
   clip_range: 0.0001
-  beta: 0.0
+  beta: 0.01
   eval_freq: 500  # Frequency of evaluation (in steps)
   max_grad_norm: 1.0
   max_log_diff: 10.0  # Maximum log probability difference for numerical stability (prevents exp overflow)
