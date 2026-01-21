@@ -524,7 +524,7 @@ def load_pretrained_checkpoint(model, checkpoint_path, device, strict=False):
     return checkpoint
 
 
-@hydra.main(version_base=None, config_path=".", config_name="train")
+@hydra.main(version_base=None, config_path="configs", config_name="train")
 def main(cfg: DictConfig):
     """
     Main FlowGRPO training function with Hydra configuration.

@@ -34,7 +34,7 @@ from model import SimpleUNet
 MNIST_IMG_SIZE = 28
 
 
-@hydra.main(version_base=None, config_path=".", config_name="train0")
+@hydra.main(version_base=None, config_path="configs", config_name="train0")
 def main(cfg: DictConfig):
     """Main training function with Hydra configuration."""
     
