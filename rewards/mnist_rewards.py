@@ -47,6 +47,9 @@ def get_recommended_reward_config(config_name: str = 'large', device: str = 'cud
     - 'bimodal': Requires both black AND white regions
     - 'connected': Penalizes fragmented/scattered pixels
     - 'stroke': Rewards consistent stroke widths
+
+    Classifier-based rewards:
+    - 'classifier0' to 'classifier9': Encourages digits to look like class N
     """
     # Lazy import to avoid circular dependency
     configs = {
@@ -64,6 +67,10 @@ def get_recommended_reward_config(config_name: str = 'large', device: str = 'cud
         'connected': MNISTConnectedReward(device=device),
         'stroke': MNISTStrokeConsistencyReward(device=device),
     }
+
+    # Add classifier rewards for each digit
+    for digit in range(10):
+        configs[f'classifier{digit}'] = MNISTClassifierReward(target_class=digit, device=device)
 
     return configs.get(config_name, configs['large'])
 
@@ -557,6 +564,106 @@ class MNISTStrokeConsistencyReward:
                 rewards.append(float(torch.clamp(reward, 0.0, 1.0)))
 
         return torch.tensor(rewards, device=self.device)
+
+
+# ============================================================================
+# CLASSIFIER-BASED REWARDS - Use a trained classifier to guide generation
+# ============================================================================
+
+class TinyClassifier(nn.Module):
+    """
+    Tiny CNN classifier for MNIST (~13K parameters).
+
+    Architecture:
+        Conv(1->8, 3x3) -> ReLU -> MaxPool -> Conv(8->16, 3x3) -> ReLU -> MaxPool -> FC(784->10)
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 8, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.fc = nn.Linear(16 * 7 * 7, 10)  # 28->14->7 after two MaxPool
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass. Input: [B, 1, 28, 28] or [B, 784]. Output: [B, 10] logits."""
+        if x.dim() == 2:
+            x = x.view(-1, 1, 28, 28)
+        elif x.dim() == 3:
+            x = x.unsqueeze(1)
+
+        x = self.pool(torch.relu(self.conv1(x)))   # [B, 8, 14, 14]
+        x = self.pool(torch.relu(self.conv2(x)))   # [B, 16, 7, 7]
+        x = x.view(x.size(0), -1)                  # [B, 784]
+        x = self.fc(x)                             # [B, 10]
+        return x
+
+
+class MNISTClassifierReward:
+    """
+    Classifier-based reward: Encourages digits to look like a target class.
+
+    When target_class=0, the model is rewarded for generating images that
+    the classifier thinks are 0s, regardless of the conditioning label.
+    This can be used to study mode collapse or style transfer.
+
+    Usage:
+        reward_fn = MNISTClassifierReward(target_class=0, device='cuda')
+        rewards = reward_fn(images, prompts)  # High reward when classifier predicts 0
+    """
+
+    def __init__(
+        self,
+        target_class: int = 0,
+        checkpoint_path: str = None,
+        device: str = 'cuda',
+        temperature: float = 1.0,
+    ):
+        """
+        Args:
+            target_class: The digit class to encourage (0-9)
+            checkpoint_path: Path to classifier checkpoint. If None, uses default path.
+            device: Device to run on
+            temperature: Softmax temperature (higher = softer rewards)
+        """
+        self.target_class = target_class
+        self.device = device
+        self.temperature = temperature
+
+        # Load classifier
+        self.classifier = TinyClassifier().to(device)
+
+        if checkpoint_path is None:
+            import os
+            checkpoint_path = os.path.join(
+                os.path.dirname(__file__), 'classifier_checkpoint.pt'
+            )
+
+        if os.path.exists(checkpoint_path):
+            state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+            self.classifier.load_state_dict(state_dict)
+            print(f"Loaded classifier from {checkpoint_path}")
+        else:
+            print(f"Warning: No checkpoint found at {checkpoint_path}. Using random weights.")
+
+        self.classifier.eval()
+        for param in self.classifier.parameters():
+            param.requires_grad = False
+
+    def __call__(self, images: torch.Tensor, prompts: List[str], **kwargs) -> torch.Tensor:
+        """
+        Compute classifier-based rewards.
+
+        Returns probability that the classifier assigns to target_class.
+        """
+        images = _preprocess_images(images).to(self.device)
+
+        with torch.no_grad():
+            logits = self.classifier(images)
+            probs = torch.softmax(logits / self.temperature, dim=-1)
+            rewards = probs[:, self.target_class]
+
+        return rewards
 
 
 # ============================================================================
