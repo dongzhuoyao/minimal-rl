@@ -645,7 +645,16 @@ def main(cfg: DictConfig):
     train_iter = iter(train_loader)
     step = 0
     epoch = 0
-    
+
+    # Running averages for logging
+    running_loss = 0.0
+    running_policy_loss = 0.0
+    running_approx_kl = 0.0
+    running_clipfrac = 0.0
+    running_kl_loss = 0.0
+    running_reward = 0.0
+    running_count = 0
+
     pbar = tqdm(total=cfg.training.max_steps, desc="Training")
     
     while step < cfg.training.max_steps:
@@ -905,27 +914,52 @@ def main(cfg: DictConfig):
                     )
                 
                 optimizer.step()
-                
+
+                # Accumulate running averages
+                running_loss += float(total_loss.item())
+                running_policy_loss += float(np.mean(info["policy_loss"]))
+                running_approx_kl += float(np.mean(info["approx_kl"]))
+                running_clipfrac += float(np.mean(info["clipfrac"]))
+                if beta > 0:
+                    running_kl_loss += float(np.mean(info["kl_loss"]))
+                batch_rewards = [s["reward"] for s in batch_samples]
+                running_reward += float(np.mean(batch_rewards))
+                running_count += 1
+
                 step += 1
                 pbar.update(1)
-                
+
                 # Logging
                 if cfg.wandb.enabled and step % cfg.wandb.log_freq == 0:
-                    batch_rewards = [s["reward"] for s in batch_samples]
-                    mean_reward = float(np.mean(batch_rewards))
-                    
+                    # Compute averaged metrics
+                    avg_loss = running_loss / running_count
+                    avg_policy_loss = running_policy_loss / running_count
+                    avg_approx_kl = running_approx_kl / running_count
+                    avg_clipfrac = running_clipfrac / running_count
+                    avg_reward = running_reward / running_count
+
                     log_dict = {
-                        "train/loss": float(total_loss.item()),
-                        "train/policy_loss": float(np.mean(info["policy_loss"])),
-                        "train/approx_kl": float(np.mean(info["approx_kl"])),
-                        "train/clipfrac": float(np.mean(info["clipfrac"])),
+                        "train/loss": avg_loss,
+                        "train/policy_loss": avg_policy_loss,
+                        "train/approx_kl": avg_approx_kl,
+                        "train/clipfrac": avg_clipfrac,
                         "train/learning_rate": float(optimizer.param_groups[0]['lr']),
-                        "train/mean_reward": mean_reward,
+                        "train/mean_reward": avg_reward,
                         "train/mean_advantage": float(advantages_clipped.mean().item()),
                         "step": step,
                     }
                     if beta > 0:
-                        log_dict["train/kl_loss"] = float(np.mean(info["kl_loss"]))
+                        avg_kl_loss = running_kl_loss / running_count
+                        log_dict["train/kl_loss"] = avg_kl_loss
+
+                    # Reset running averages
+                    running_loss = 0.0
+                    running_policy_loss = 0.0
+                    running_approx_kl = 0.0
+                    running_clipfrac = 0.0
+                    running_kl_loss = 0.0
+                    running_reward = 0.0
+                    running_count = 0
 
                     # Visualize sampled images during training
                     num_images_to_log = min(16, len(batch_samples))
