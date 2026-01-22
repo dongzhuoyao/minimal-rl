@@ -7,3 +7,4 @@ best_model.pt
 best_model.pt
 venv/
 checkpoint_step_43500.pt
+data
